@@ -17,7 +17,8 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 from azure.devops.connection import Connection
-from azure.devops.v7_0.work_item_tracking.models import Wiql
+from azure.devops.v7_0.git.models import GitPullRequestSearchCriteria
+from azure.devops.v7_0.work_item_tracking.models import TeamContext, Wiql
 from msrest.authentication import BasicAuthentication
 from utils.env import load_env_file
 from utils.logger import audit
@@ -40,6 +41,27 @@ def get_project():
     return os.environ.get("AZURE_PROJECT", "KwikLedgers")
 
 
+EMPTY_INPUT_SCHEMA = {"type": "object", "properties": {}}
+
+
+def get_team_context() -> TeamContext:
+    return TeamContext(project=get_project())
+
+
+def get_active_pr_search_criteria() -> GitPullRequestSearchCriteria:
+    return GitPullRequestSearchCriteria(status="active")
+
+
+def get_age_days(created_at: Optional[datetime]) -> int:
+    if created_at is None:
+        return 0
+
+    if created_at.tzinfo is not None:
+        return (datetime.now(created_at.tzinfo) - created_at).days
+
+    return (datetime.utcnow() - created_at).days
+
+
 # --- Servidor MCP ---
 
 server = Server("kwikledgers-azure-devops")
@@ -49,13 +71,13 @@ server = Server("kwikledgers-azure-devops")
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
-        Tool(name="get_active_user", description="Retorna o email do usuario ativo via git config"),
-        Tool(name="get_my_work_items", description="Lista historias, tasks e bugs atribuidos ao usuario ativo no sprint atual"),
-        Tool(name="get_my_blocked_items", description="Lista itens bloqueados atribuidos ao usuario ativo no sprint atual"),
-        Tool(name="get_my_daily_summary", description="Retorna um resumo JSON do sprint atual com itens do usuario ativo, bloqueios, PRs e story points restantes"),
+       Tool(name="get_active_user", description="Retorna o email do usuario ativo via git config", inputSchema=EMPTY_INPUT_SCHEMA),
+       Tool(name="get_my_work_items", description="Lista historias, tasks e bugs atribuidos ao usuario ativo no sprint atual", inputSchema=EMPTY_INPUT_SCHEMA),
+       Tool(name="get_my_blocked_items", description="Lista itens bloqueados atribuidos ao usuario ativo no sprint atual", inputSchema=EMPTY_INPUT_SCHEMA),
+       Tool(name="get_my_daily_summary", description="Retorna um resumo JSON do sprint atual com itens do usuario ativo, bloqueios, PRs e story points restantes", inputSchema=EMPTY_INPUT_SCHEMA),
         Tool(name="get_user_stories", description="Lista historias do Azure DevOps atribuidas ao email informado",
              inputSchema={"type": "object", "properties": {"email": {"type": "string"}}, "required": ["email"]}),
-        Tool(name="get_sprint_stories", description="Lista todas as historias do sprint atual do projeto"),
+       Tool(name="get_sprint_stories", description="Lista todas as historias do sprint atual do projeto", inputSchema=EMPTY_INPUT_SCHEMA),
         Tool(name="get_story_details", description="Retorna detalhes completos de uma historia: criterios, tasks, story points",
              inputSchema={"type": "object", "properties": {"story_id": {"type": "integer"}}, "required": ["story_id"]}),
         Tool(name="get_open_prs", description="Lista PRs abertas atribuidas ao usuario",
@@ -153,7 +175,7 @@ def _query_assigned_items(email: str) -> list[dict[str, Any]]:
         ORDER BY [System.ChangedDate] DESC
     """)
 
-    result = wit.query_by_wiql(query, project=get_project())
+    result = wit.query_by_wiql(query, team_context=get_team_context())
     if not result.work_items:
         return []
 
@@ -194,13 +216,16 @@ def _build_daily_summary(email: str) -> dict[str, Any]:
     git = connection.clients.get_git_client()
     repos = git.get_repositories(project=get_project())
     for repo in repos:
-        prs = git.get_pull_requests(repository_id=repo.id, search_criteria={"status": "active"})
+        prs = git.get_pull_requests(
+            repository_id=repo.id,
+            search_criteria=get_active_pr_search_criteria(),
+        )
         for pr in prs:
             creator_email = getattr(pr.created_by, "unique_name", "")
             if email.lower() not in creator_email.lower():
                 continue
 
-            age_days = (datetime.utcnow() - pr.creation_date).days
+            age_days = get_age_days(pr.creation_date)
             open_prs.append({
                 "pull_request_id": pr.pull_request_id,
                 "title": pr.title,
@@ -288,7 +313,7 @@ def _get_user_stories(email: str) -> str:
         ORDER BY [Microsoft.VSTS.Common.Priority] ASC
     """)
 
-    result = wit.query_by_wiql(query, project=get_project())
+    result = wit.query_by_wiql(query, team_context=get_team_context())
     if not result.work_items:
         return "Nenhuma historia encontrada para este usuario."
 
@@ -326,7 +351,7 @@ def _get_sprint_stories() -> str:
         ORDER BY [Microsoft.VSTS.Common.Priority] ASC
     """)
 
-    result = wit.query_by_wiql(query, project=get_project())
+    result = wit.query_by_wiql(query, team_context=get_team_context())
     if not result.work_items:
         return "Nenhuma historia no sprint atual."
 
@@ -416,12 +441,12 @@ def _get_open_prs(email: str) -> str:
     for repo in repos:
         prs = git.get_pull_requests(
             repository_id=repo.id,
-            search_criteria={"status": "active"}
+            search_criteria=get_active_pr_search_criteria()
         )
         for pr in prs:
             creator_email = getattr(pr.created_by, "unique_name", "")
             if email.lower() in creator_email.lower():
-                age_days = (datetime.utcnow() - pr.creation_date).days
+                age_days = get_age_days(pr.creation_date)
                 open_prs.append(
                     f"PR #{pr.pull_request_id}: {pr.title}\n"
                     f"  Repo: {repo.name} | Branch: {pr.source_ref_name} -> {pr.target_ref_name}\n"
