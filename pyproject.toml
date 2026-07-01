@@ -1,0 +1,20 @@
+[project]
+name = "agent"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Marcos Pereira",email = "dev@kwikledgers.com"}
+]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "azure-devops (>=7.1.0b4,<8.0.0)",
+    "msrest (>=0.7.1,<0.8.0)",
+    "python-dotenv (>=1.2.2,<2.0.0)",
+    "mcp (>=1.28.1,<2.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

@@ -1,0 +1,4 @@
+﻿mcp>=1.0.0
+azure-devops>=7.1.0b1
+msrest>=0.7.1
+python-dotenv>=1.0.0
