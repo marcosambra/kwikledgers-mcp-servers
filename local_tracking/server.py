@@ -212,6 +212,9 @@ def _update_task_control(summary: str) -> str:
     returned_items = payload.get("returned_items", [])
     open_prs = payload.get("open_prs", [])
     counts = payload.get("counts", {})
+    project_progress = payload.get("project_progress", {})
+    sprint_stories = payload.get("sprint_stories", [])
+    sprint_context = payload.get("sprint_context", {})
 
     lines = [
         "# Sprint Control Snapshot",
@@ -220,19 +223,47 @@ def _update_task_control(summary: str) -> str:
         f"Usuario: {payload.get('user_email', 'desconhecido')}",
         f"Projeto: {payload.get('project', 'desconhecido')}",
         "",
+        "## Contexto do sprint",
+        "",
+        f"- Nome: {sprint_context.get('name') or 'desconhecido'}",
+        f"- Caminho: {sprint_context.get('path') or 'desconhecido'}",
+        f"- Inicio: {sprint_context.get('start_date') or 'nao informado'}",
+        f"- Fim: {sprint_context.get('finish_date') or 'nao informado'}",
+        f"- Goal: {sprint_context.get('goal') or 'nao exposto pela API atual'}",
+        "",
         "## Resumo",
         "",
         f"- Itens atribuídos: {counts.get('assigned_items', 0)}",
         f"- Itens bloqueados: {counts.get('blocked_items', 0)}",
         f"- Itens devolvidos ao usuario: {len(returned_items)}",
-        f"- User stories no sprint: {counts.get('user_stories', 0)}",
+        f"- User stories do usuario no sprint: {counts.get('user_stories', 0)}",
+        f"- Historias totais do sprint: {project_progress.get('total_stories', counts.get('sprint_stories', len(sprint_stories)))}",
         f"- PRs abertas: {counts.get('open_prs', 0)}",
-        f"- Story points restantes: {payload.get('remaining_story_points', 0)}",
+        f"- Story points restantes do projeto: {payload.get('remaining_story_points', 0)}",
+        f"- Story points atribuidos ao usuario: {payload.get('assigned_story_points', 0)}",
         f"- Horas restantes estimadas: {payload.get('remaining_work_hours', 0)}",
         "",
-        "## Itens atribuídos",
+        "## Progresso do projeto no sprint",
+        "",
+        f"- Historias concluidas: {project_progress.get('completed_stories', 0)}",
+        f"- Historias ativas: {project_progress.get('active_stories', 0)}",
+        f"- Historias bloqueadas: {project_progress.get('blocked_stories', 0)}",
+        f"- Historias sem responsavel: {project_progress.get('unassigned_stories', 0)}",
+        f"- Historias sem estimativa: {project_progress.get('unestimated_stories', 0)}",
+        f"- Historias ativas sem estimativa: {project_progress.get('active_unestimated_stories', 0)}",
+        f"- Story points totais: {project_progress.get('total_story_points', 0)}",
+        f"- Story points concluidos: {project_progress.get('completed_story_points', 0)}",
+        f"- Story points restantes: {project_progress.get('remaining_story_points', payload.get('remaining_story_points', 0))}",
+        f"- Progresso por historias: {project_progress.get('progress_percent_by_story_count', 0)}%",
+        f"- Progresso por story points: {project_progress.get('progress_percent_by_story_points', 0)}%",
         "",
     ]
+
+    progress_warning = project_progress.get("progress_warning")
+    if progress_warning:
+        lines.extend(["## Alerta de estimativa", "", f"- {progress_warning}", ""])
+
+    lines.extend(["## Itens atribuídos", ""])
 
     if items:
         for item in items:
@@ -267,6 +298,16 @@ def _update_task_control(summary: str) -> str:
     else:
         lines.append("- Nenhuma PR aberta.")
 
+    lines.extend(["", "## Historias do sprint", ""])
+    if sprint_stories:
+        for story in sprint_stories:
+            lines.append(
+                f"- KL-{story.get('id')}: {story.get('title')} | {story.get('state')} | "
+                f"points={story.get('story_points')} | responsavel={story.get('assigned_to')} | blocked={story.get('is_blocked')}"
+            )
+    else:
+        lines.append("- Nenhuma historia retornada para o sprint atual.")
+
     md_path.write_text("\n".join(lines) + "\n")
     return (
         f"Arquivos atualizados: {json_path} e {md_path}. "
@@ -277,14 +318,22 @@ def _update_task_control(summary: str) -> str:
 def _build_default_log_details(payload: dict[str, Any]) -> str:
     counts = payload.get("counts", {})
     returned_items = payload.get("returned_items", [])
+    project_progress = payload.get("project_progress", {})
+    sprint_context = payload.get("sprint_context", {})
     lines = [
         f"Resumo do sprint para {payload.get('user_email', 'desconhecido')}.",
+        f"Sprint atual: {sprint_context.get('name') or 'desconhecido'}.",
+        f"Goal do sprint: {sprint_context.get('goal') or 'nao exposto pela API atual'}.",
         f"Itens atribuídos: {counts.get('assigned_items', 0)}.",
         f"Itens bloqueados: {counts.get('blocked_items', 0)}.",
         f"Itens devolvidos detectados: {len(returned_items)}.",
-        f"Story points restantes: {payload.get('remaining_story_points', 0)}.",
+        f"Historias totais do sprint: {project_progress.get('total_stories', counts.get('sprint_stories', 0))}.",
+        f"Story points restantes do projeto: {payload.get('remaining_story_points', 0)}.",
+        f"Progresso do projeto: {project_progress.get('progress_percent_by_story_count', 0)}% por historias e {project_progress.get('progress_percent_by_story_points', 0)}% por story points.",
         f"PRs abertas: {counts.get('open_prs', 0)}.",
     ]
+    if project_progress.get("progress_warning"):
+        lines.append(project_progress["progress_warning"])
     return "\n".join(lines)
 
 
