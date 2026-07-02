@@ -80,6 +80,7 @@ WORK_ITEM_FIELD_CACHE: dict[tuple[str, str], set[str]] = {}
 TEAM_CONTEXT_CACHE: dict[str, str] = {}
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 TECHNICAL_DEBT_CONTEXT_DIR = WORKSPACE_ROOT / "AI_Tracking" / "Repo_Work_Item_Context" / "technical_debts"
+TECHNICAL_DEBT_PREVIEW_CACHE_DIR = WORKSPACE_ROOT / "AI_Tracking" / "Repo_Work_Item_Context" / "technical_debt_previews"
 SIMILARITY_STOPWORDS = {
     "a", "ao", "aos", "as", "bug", "bugs", "com", "como", "da", "das", "de", "debito",
     "debt", "do", "dos", "e", "em", "for", "generic", "historia", "issue", "it", "its",
@@ -161,6 +162,35 @@ async def list_tools() -> list[Tool]:
                      "title": {"type": "string"},
                      "description": {"type": "string"},
                      "limit": {"type": "integer"}
+                 },
+                 "required": ["repository_name", "title"]
+             }),
+        Tool(name="save_technical_debt_preview_cache", description="Salva um preview provisório de debito tecnico com item pai, child tasks e status de implementacao local por repositorio",
+             inputSchema={
+                 "type": "object",
+                 "properties": {
+                     "repository_name": {"type": "string"},
+                     "title": {"type": "string"},
+                     "description": {"type": "string"},
+                     "acceptance_criteria": {"type": "string"},
+                     "target_iteration_path": {"type": "string"},
+                     "story_points": {"type": "number"},
+                     "implementation_status": {"type": "string"},
+                     "implementation_notes": {"type": "string"},
+                     "child_tasks": {
+                         "type": "array",
+                         "items": {
+                             "type": "object",
+                             "properties": {
+                                 "title": {"type": "string"},
+                                 "description": {"type": "string"},
+                                 "acceptance_criteria": {"type": "string"},
+                                 "developer_suggestion": {"type": "string"},
+                                 "remaining_work_hours": {"type": "number"}
+                             },
+                             "required": ["title"]
+                         }
+                     }
                  },
                  "required": ["repository_name", "title"]
              }),
@@ -262,6 +292,18 @@ async def _dispatch(name: str, arguments: dict) -> str:
             title=arguments["title"],
             description=arguments.get("description"),
             limit=int(arguments.get("limit", 5) or 5),
+        )
+    if name == "save_technical_debt_preview_cache":
+        return _save_technical_debt_preview_cache(
+            repository_name=arguments["repository_name"],
+            title=arguments["title"],
+            description=arguments.get("description"),
+            acceptance_criteria=arguments.get("acceptance_criteria"),
+            target_iteration_path=arguments.get("target_iteration_path"),
+            story_points=arguments.get("story_points"),
+            implementation_status=arguments.get("implementation_status"),
+            implementation_notes=arguments.get("implementation_notes"),
+            child_tasks=arguments.get("child_tasks"),
         )
     if name == "update_work_item_content":
         return _update_work_item_content(
@@ -376,7 +418,18 @@ def _normalize_markdown_lines(value: str | None) -> list[str]:
 
     normalized = str(value).replace("\r\n", "\n").replace("\r", "\n")
     expanded_lines: list[str] = []
+    inside_code_fence = False
     for raw_line in normalized.split("\n"):
+        stripped_line = raw_line.strip()
+        if stripped_line.startswith("```"):
+            expanded_lines.append(raw_line)
+            inside_code_fence = not inside_code_fence
+            continue
+
+        if inside_code_fence:
+            expanded_lines.append(raw_line)
+            continue
+
         split_lines = _split_inline_numbered_items(raw_line)
         expanded_lines.extend(split_lines or [raw_line])
     return expanded_lines
@@ -387,6 +440,8 @@ def _render_lines_as_azure_html(lines: list[str]) -> str:
     paragraph_lines: list[str] = []
     list_type: str | None = None
     list_items: list[str] = []
+    code_language: str | None = None
+    code_lines: list[str] = []
 
     def flush_paragraph() -> None:
         nonlocal paragraph_lines
@@ -411,8 +466,35 @@ def _render_lines_as_azure_html(lines: list[str]) -> str:
         list_type = None
         list_items = []
 
+    def flush_code_block() -> None:
+        nonlocal code_language, code_lines
+        if code_language is None:
+            return
+        code_content = "\n".join(code_lines)
+        escaped_code = escape(code_content, quote=False)
+        language_attr = f' class="language-{escape(code_language, quote=True)}"' if code_language else ""
+        html_parts.append(f"<pre><code{language_attr}>{escaped_code}</code></pre>")
+        code_language = None
+        code_lines = []
+
     for raw_line in lines:
         line = str(raw_line or "").strip()
+        fence_match = re.fullmatch(r"```\s*([A-Za-z0-9_+\-]*)\s*", line)
+
+        if code_language is not None:
+            if fence_match:
+                flush_code_block()
+            else:
+                code_lines.append(str(raw_line or ""))
+            continue
+
+        if fence_match:
+            flush_paragraph()
+            flush_list()
+            code_language = fence_match.group(1).strip() or "text"
+            code_lines = []
+            continue
+
         if not line:
             flush_paragraph()
             flush_list()
@@ -456,6 +538,7 @@ def _render_lines_as_azure_html(lines: list[str]) -> str:
 
     flush_paragraph()
     flush_list()
+    flush_code_block()
     return "".join(html_parts)
 
 
@@ -529,6 +612,141 @@ def _save_repo_technical_debt_context(repository_name: str, technical_debts: lis
     context_path = _get_technical_debt_context_path(repository_name)
     context_path.write_text(_format_json(context_payload) + "\n", encoding="utf-8")
     return str(context_path)
+
+
+def _get_technical_debt_preview_cache_path(repository_name: str) -> Path:
+    preview_file_name = f"{_normalize_repository_key(repository_name)}.json"
+    return TECHNICAL_DEBT_PREVIEW_CACHE_DIR / preview_file_name
+
+
+def _load_repo_technical_debt_preview_cache(repository_name: str) -> dict[str, Any]:
+    cache_path = _get_technical_debt_preview_cache_path(repository_name)
+    if not cache_path.exists():
+        return {
+            "repository_name": repository_name,
+            "updated_at": None,
+            "preview_entries": [],
+        }
+
+    try:
+        return json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {
+            "repository_name": repository_name,
+            "updated_at": None,
+            "preview_entries": [],
+        }
+
+
+def _normalize_implementation_status(value: str | None) -> str:
+    normalized_value = _normalize_lookup_key(value)
+    status_aliases = {
+        "": "nao_verificado",
+        "nao verificado": "nao_verificado",
+        "nao verificada": "nao_verificado",
+        "not verified": "nao_verificado",
+        "ja implementado": "ja_implementado",
+        "ja implementada": "ja_implementado",
+        "already implemented": "ja_implementado",
+        "implemented": "ja_implementado",
+        "parcialmente implementado": "parcialmente_implementado",
+        "parcialmente implementada": "parcialmente_implementado",
+        "partially implemented": "parcialmente_implementado",
+        "partial": "parcialmente_implementado",
+        "nao implementado": "nao_implementado",
+        "nao implementada": "nao_implementado",
+        "not implemented": "nao_implementado",
+    }
+    return status_aliases.get(normalized_value, normalized_value.replace(" ", "_") or "nao_verificado")
+
+
+def _save_repo_technical_debt_preview_entry(
+    repository_name: str,
+    preview_entry: dict[str, Any],
+) -> str:
+    TECHNICAL_DEBT_PREVIEW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_payload = _load_repo_technical_debt_preview_cache(repository_name)
+    existing_entries = cache_payload.get("preview_entries", []) or []
+    normalized_title = _normalize_lookup_key(preview_entry.get("title"))
+
+    merged_entries = [
+        entry for entry in existing_entries
+        if _normalize_lookup_key(entry.get("title")) != normalized_title
+    ]
+    merged_entries.insert(0, preview_entry)
+
+    final_payload = {
+        "repository_name": repository_name,
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+        "preview_entries": merged_entries,
+    }
+    cache_path = _get_technical_debt_preview_cache_path(repository_name)
+    cache_path.write_text(_format_json(final_payload) + "\n", encoding="utf-8")
+    return str(cache_path)
+
+
+def _normalize_child_task_preview(task: Any) -> dict[str, Any]:
+    if not isinstance(task, dict):
+        raise ValueError("Cada child task do preview deve ser um objeto JSON.")
+
+    title = str(task.get("title") or "").strip()
+    if not title:
+        raise ValueError("Cada child task do preview precisa de title.")
+
+    return {
+        "title": title,
+        "description": str(task.get("description") or "").strip() or None,
+        "acceptance_criteria": str(task.get("acceptance_criteria") or "").strip() or None,
+        "developer_suggestion": str(task.get("developer_suggestion") or "").strip() or None,
+        "remaining_work_hours": task.get("remaining_work_hours"),
+    }
+
+
+@audit("kwikledgers.azure_devops")
+def _save_technical_debt_preview_cache(
+    repository_name: str,
+    title: str,
+    description: str | None = None,
+    acceptance_criteria: str | None = None,
+    target_iteration_path: str | None = None,
+    story_points: float | None = None,
+    implementation_status: str | None = None,
+    implementation_notes: str | None = None,
+    child_tasks: Any = None,
+) -> str:
+    normalized_repository_name = str(repository_name or "").strip()
+    normalized_title = str(title or "").strip()
+    if not normalized_repository_name:
+        raise ValueError("repository_name e obrigatorio para salvar o preview provisório do debito tecnico.")
+    if not normalized_title:
+        raise ValueError("title e obrigatorio para salvar o preview provisório do debito tecnico.")
+
+    normalized_child_tasks = [
+        _normalize_child_task_preview(task)
+        for task in (child_tasks or [])
+    ]
+    preview_entry = {
+        "title": normalized_title,
+        "description": str(description or "").strip() or None,
+        "acceptance_criteria": str(acceptance_criteria or "").strip() or None,
+        "target_iteration_path": str(target_iteration_path or "").strip() or None,
+        "story_points": story_points,
+        "implementation_status": _normalize_implementation_status(implementation_status),
+        "implementation_notes": str(implementation_notes or "").strip() or None,
+        "child_tasks": normalized_child_tasks,
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
+    cache_path = _save_repo_technical_debt_preview_entry(normalized_repository_name, preview_entry)
+    return _format_json(
+        {
+            "repository_name": normalized_repository_name,
+            "title": normalized_title,
+            "implementation_status": preview_entry["implementation_status"],
+            "child_task_count": len(normalized_child_tasks),
+            "cache_path": cache_path,
+            "saved": True,
+        }
+    )
 
 
 def _infer_repository_name(repository_name: str | None, title: str | None, description: str | None) -> str | None:
