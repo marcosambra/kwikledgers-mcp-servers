@@ -2,7 +2,9 @@
 KwikLedgers - MCP Server: Windows Calendar & Notifications
 Suporta Windows nativo e WSL (usa powershell.exe do host para notificacoes).
 """
+import base64
 import os
+import re
 import sys
 import asyncio
 import subprocess
@@ -22,6 +24,9 @@ load_env_file(Path(__file__))
 
 # Detecta se esta rodando dentro do WSL
 IS_WSL = "microsoft" in (open("/proc/version").read().lower() if os.path.exists("/proc/version") else "")
+
+DEFAULT_NOTIFICATION_TIMEOUT_SECONDS = 20
+DEFAULT_OUTLOOK_TIMEOUT_SECONDS = 90
 
 server = Server("kwikledgers-windows")
 
@@ -112,12 +117,121 @@ async def _dispatch(name: str, arguments: dict) -> str:
 
 # --- Helpers de ambiente ---
 
-def _run_powershell(script: str) -> subprocess.CompletedProcess:
-    """Executa PowerShell — usa powershell.exe do Windows host quando em WSL."""
-    cmd = ["powershell.exe"] if IS_WSL else ["powershell", "-NoProfile", "-Command"]
-    if IS_WSL:
-        return subprocess.run([*cmd, "-NoProfile", "-Command", script], capture_output=True, text=True, timeout=15)
-    return subprocess.run([*cmd, script], capture_output=True, text=True, timeout=15)
+def _get_timeout_seconds(env_name: str, default: int) -> int:
+    raw_value = os.getenv(env_name, str(default)).strip()
+    try:
+        parsed_value = int(raw_value)
+    except ValueError:
+        return default
+    return parsed_value if parsed_value > 0 else default
+
+
+def _powershell_literal(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def _encode_powershell_script(script: str) -> str:
+    return base64.b64encode(script.encode("utf-16le")).decode("ascii")
+
+
+def _decode_powershell_output(raw_output: bytes | str | None) -> str:
+    if raw_output is None:
+        return ""
+    if isinstance(raw_output, str):
+        return raw_output
+    for encoding in ("utf-8", "cp1252", "cp850", "latin-1"):
+        try:
+            return raw_output.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw_output.decode("utf-8", errors="replace")
+
+
+def _sanitize_powershell_output(text: str) -> str:
+    cleaned = text.replace("#< CLIXML", "").replace("_x000D__x000A_", "\n")
+    error_lines = re.findall(r'<S S="Error">(.*?)</S>', cleaned, flags=re.S)
+    if error_lines:
+        cleaned = "\n".join(error_lines)
+    cleaned = re.sub(r"<[^>]+>", "", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _compose_powershell_script(body: str, include_outlook_helper: bool = False) -> str:
+    prelude = [
+        "$ErrorActionPreference = 'Stop'",
+        "$ProgressPreference = 'SilentlyContinue'",
+        "$OutputEncoding = [System.Text.Encoding]::UTF8",
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8",
+    ]
+    if include_outlook_helper:
+        prelude.extend([
+            "function Get-OutlookApplication {",
+            "    $attempts = 6",
+            "    for ($attempt = 1; $attempt -le $attempts; $attempt++) {",
+            "        try {",
+            "            try {",
+            "                return [System.Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application')",
+            "            } catch {",
+            "                return New-Object -ComObject Outlook.Application",
+            "            }",
+            "        } catch [System.Runtime.InteropServices.COMException] {",
+            "            if ($_.Exception.HResult -eq -2147418111 -and $attempt -lt $attempts) {",
+            "                Start-Sleep -Seconds 2",
+            "                continue",
+            "            }",
+            "            throw",
+            "        }",
+            "    }",
+            "    throw 'Nao foi possivel obter a automacao do Outlook apos varias tentativas.'",
+            "}",
+        ])
+    prelude.append(body.strip())
+    return "\n".join(prelude)
+
+
+def _run_powershell(script: str, timeout_seconds: int) -> subprocess.CompletedProcess:
+    """Executa PowerShell usando EncodedCommand para evitar problemas de quoting no WSL."""
+    shell_name = "powershell.exe" if IS_WSL else "powershell"
+    encoded_script = _encode_powershell_script(script)
+    cmd = [
+        shell_name,
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-STA",
+        "-EncodedCommand",
+        encoded_script,
+    ]
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(
+            exc.cmd,
+            124,
+            _decode_powershell_output(exc.stdout),
+            (
+                "PowerShell expirou apos "
+                f"{timeout_seconds} segundos ao executar a integracao Windows. "
+                "O Outlook pode estar preso em primeiro acesso, perfil MAPI bloqueado ou COM indisponivel no host."
+            ),
+        )
+
+
+def _format_powershell_error(action: str, result: subprocess.CompletedProcess) -> str:
+    stderr_text = _decode_powershell_output(result.stderr)
+    stdout_text = _decode_powershell_output(result.stdout)
+    details = _sanitize_powershell_output(
+        stderr_text or stdout_text or "Falha sem detalhes retornados pelo PowerShell."
+    )
+    return f"Erro ao {action}: {details}"
 
 
 # --- Implementacoes ---
@@ -139,29 +253,39 @@ def _send_notification(title: str, message: str, urgency: str = "normal") -> str
             pass
 
     # WSL ou fallback: usa powershell.exe do host Windows
-    ps_script = f"""
+    safe_title = _powershell_literal(title)
+    safe_message = _powershell_literal(message)
+    timeout_seconds = _get_timeout_seconds(
+        "KWIKLEDGERS_WINDOWS_NOTIFICATION_TIMEOUT_SECONDS",
+        DEFAULT_NOTIFICATION_TIMEOUT_SECONDS,
+    )
+    ps_script = _compose_powershell_script(f"""
     [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
     [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
     $template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(
         [Windows.UI.Notifications.ToastTemplateType]::ToastText02)
-    $template.SelectSingleNode('//text[@id=1]').InnerText = '{title}'
-    $template.SelectSingleNode('//text[@id=2]').InnerText = '{message}'
+    $template.SelectSingleNode('//text[@id=1]').InnerText = '{safe_title}'
+    $template.SelectSingleNode('//text[@id=2]').InnerText = '{safe_message}'
     $toast = [Windows.UI.Notifications.ToastNotification]::new($template)
     [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('KwikLedgers').Show($toast)
-    """
-    result = _run_powershell(ps_script)
+    Write-Output 'OK'
+    """)
+    result = _run_powershell(ps_script, timeout_seconds=timeout_seconds)
     if result.returncode != 0:
         # Fallback simples com BalloonTip
-        fallback = f"""
+        fallback = _compose_powershell_script(f"""
         Add-Type -AssemblyName System.Windows.Forms
         $n = New-Object System.Windows.Forms.NotifyIcon
         $n.Icon = [System.Drawing.SystemIcons]::Information
         $n.Visible = $true
-        $n.ShowBalloonTip(5000, '{title}', '{message}', 'Info')
+        $n.ShowBalloonTip(5000, '{safe_title}', '{safe_message}', 'Info')
         Start-Sleep -Seconds 6
         $n.Dispose()
-        """
-        _run_powershell(fallback)
+        Write-Output 'OK'
+        """)
+        fallback_result = _run_powershell(fallback, timeout_seconds=timeout_seconds)
+        if fallback_result.returncode != 0:
+            return _format_powershell_error("enviar notificacao", fallback_result)
     return f"Notificacao enviada: {title}"
 
 
@@ -188,21 +312,29 @@ def _create_calendar_event(
             pass
 
     # WSL: usa powershell.exe do host
-    ps_script = f"""
-    $outlook = New-Object -ComObject Outlook.Application
+    safe_title = _powershell_literal(title)
+    safe_description = _powershell_literal(description)
+    safe_start = _powershell_literal(start)
+    safe_end = _powershell_literal(end)
+    timeout_seconds = _get_timeout_seconds(
+        "KWIKLEDGERS_WINDOWS_OUTLOOK_TIMEOUT_SECONDS",
+        DEFAULT_OUTLOOK_TIMEOUT_SECONDS,
+    )
+    ps_script = _compose_powershell_script(f"""
+    $outlook = Get-OutlookApplication
     $appt = $outlook.CreateItem(1)
-    $appt.Subject = '{title}'
-    $appt.Body = '{description}'
-    $appt.Start = '{start}'
-    $appt.End = '{end}'
+    $appt.Subject = '{safe_title}'
+    $appt.Body = '{safe_description}'
+    $appt.Start = '{safe_start}'
+    $appt.End = '{safe_end}'
     $appt.ReminderMinutesBeforeStart = {reminder_minutes}
     $appt.ReminderSet = $true
     $appt.Save()
     Write-Output 'OK'
-    """
-    result = _run_powershell(ps_script)
+    """, include_outlook_helper=True)
+    result = _run_powershell(ps_script, timeout_seconds=timeout_seconds)
     if result.returncode != 0:
-        return f"Erro ao criar evento: {result.stderr}"
+        return _format_powershell_error("criar evento no Outlook", result)
     return f"Evento criado no Outlook: '{title}' em {start}"
 
 
@@ -211,9 +343,13 @@ def _get_upcoming_deadlines(days: int = 7) -> str:
     """Le eventos dos proximos N dias do Outlook via PowerShell."""
     now = datetime.now()
     end = now + timedelta(days=days)
+    timeout_seconds = _get_timeout_seconds(
+        "KWIKLEDGERS_WINDOWS_OUTLOOK_TIMEOUT_SECONDS",
+        DEFAULT_OUTLOOK_TIMEOUT_SECONDS,
+    )
 
-    ps_script = f"""
-    $outlook = New-Object -ComObject Outlook.Application
+    ps_script = _compose_powershell_script(f"""
+    $outlook = Get-OutlookApplication
     $ns = $outlook.GetNamespace('MAPI')
     $cal = $ns.GetDefaultFolder(9)
     $items = $cal.Items
@@ -224,11 +360,11 @@ def _get_upcoming_deadlines(days: int = 7) -> str:
     foreach ($item in $restricted) {{
         Write-Output "$($item.Start.ToString('dd/MM HH:mm')) | $($item.Subject)"
     }}
-    """
-    result = _run_powershell(ps_script)
+    """, include_outlook_helper=True)
+    result = _run_powershell(ps_script, timeout_seconds=timeout_seconds)
     if result.returncode != 0:
-        return f"Erro ao ler calendario: {result.stderr}"
-    lines = result.stdout.strip().splitlines()
+        return _format_powershell_error("ler calendario", result)
+    lines = _decode_powershell_output(result.stdout).strip().splitlines()
     if not lines:
         return f"Nenhum evento nos proximos {days} dias."
     return f"Proximos {days} dias:\n" + "\n".join(f"  {l}" for l in lines)

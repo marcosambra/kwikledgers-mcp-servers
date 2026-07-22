@@ -212,6 +212,9 @@ def _update_task_control(summary: str) -> str:
     returned_items = payload.get("returned_items", [])
     open_prs = payload.get("open_prs", [])
     counts = payload.get("counts", {})
+    assigned_items_by_type = counts.get("assigned_items_by_type", {})
+    task_state_breakdown = counts.get("tasks_by_state", {})
+    child_items_summary = payload.get("child_items_summary", {})
     project_progress = payload.get("project_progress", {})
     sprint_stories = payload.get("sprint_stories", [])
     sprint_context = payload.get("sprint_context", {})
@@ -221,6 +224,7 @@ def _update_task_control(summary: str) -> str:
         "",
         f"Data: {_today_stamp()}",
         f"Usuario: {payload.get('user_email', 'desconhecido')}",
+        f"Origem da identidade: {_format_identity_context(payload)}",
         f"Projeto: {payload.get('project', 'desconhecido')}",
         "",
         "## Contexto do sprint",
@@ -237,10 +241,15 @@ def _update_task_control(summary: str) -> str:
         f"- Itens bloqueados: {counts.get('blocked_items', 0)}",
         f"- Itens devolvidos ao usuario: {len(returned_items)}",
         f"- User stories do usuario no sprint: {counts.get('user_stories', 0)}",
+        f"- Tasks do usuario em todos os status: {counts.get('tasks_all_statuses', 0)}",
+        f"- Tasks por status: {_format_type_breakdown(task_state_breakdown)}",
+        f"- Itens atribuídos por tipo: {_format_type_breakdown(assigned_items_by_type)}",
+        f"- Children dos itens atribuídos: {child_items_summary.get('total_children', 0)}",
+        f"- Children bloqueados dos itens atribuídos: {child_items_summary.get('blocked_children', 0)}",
         f"- Historias totais do sprint: {project_progress.get('total_stories', counts.get('sprint_stories', len(sprint_stories)))}",
         f"- PRs abertas: {counts.get('open_prs', 0)}",
         f"- Story points restantes do projeto: {payload.get('remaining_story_points', 0)}",
-        f"- Story points atribuidos ao usuario: {payload.get('assigned_story_points', 0)}",
+        f"- Story points atribuidos aos itens do usuario: {payload.get('assigned_story_points', 0)}",
         f"- Horas restantes estimadas: {payload.get('remaining_work_hours', 0)}",
         "",
         "## Progresso do projeto no sprint",
@@ -280,6 +289,19 @@ def _update_task_control(summary: str) -> str:
     else:
         lines.append("- Nenhum item bloqueado.")
 
+    lines.extend(["", "## Children dos itens atribuídos", ""])
+    if child_items_summary.get("total_children", 0):
+        lines.append(
+            f"- Totais: total={child_items_summary.get('total_children', 0)} | abertas={child_items_summary.get('open_children', 0)} | bloqueadas={child_items_summary.get('blocked_children', 0)} | concluidas={child_items_summary.get('completed_children', 0)}"
+        )
+        lines.append(f"- Por tipo: {_format_type_breakdown(child_items_summary.get('children_by_type', {}))}")
+        for parent_summary in child_items_summary.get("children_by_parent", []):
+            lines.append(
+                f"- Pai KL-{parent_summary.get('parent_id')}: {parent_summary.get('parent_title')} | children={parent_summary.get('child_count')} | abertas={parent_summary.get('open_child_count')} | bloqueadas={parent_summary.get('blocked_child_count')}"
+            )
+    else:
+        lines.append("- Nenhum child encontrado para os itens atribuídos no snapshot atual.")
+
     lines.extend(["", "## Itens devolvidos ao usuario", ""])
     if returned_items:
         for item in returned_items:
@@ -315,9 +337,31 @@ def _update_task_control(summary: str) -> str:
     )
 
 
+def _format_type_breakdown(type_breakdown: Any) -> str:
+    if not isinstance(type_breakdown, dict) or not type_breakdown:
+        return "nenhum tipo contabilizado"
+
+    segments: list[str] = []
+    for work_item_type, count in sorted(type_breakdown.items(), key=lambda entry: str(entry[0]).lower()):
+        segments.append(f"{work_item_type}={count}")
+    return ", ".join(segments)
+
+def _format_identity_context(payload: dict[str, Any]) -> str:
+    identity_context = payload.get("user_identity_context", {})
+    if not isinstance(identity_context, dict):
+        return "desconhecida"
+
+    resolved_email = identity_context.get("resolved_email") or payload.get("user_email") or "desconhecido"
+    email_source = identity_context.get("email_source") or "origem-desconhecida"
+    env_file_path = identity_context.get("env_file_path")
+    if env_file_path:
+        return f"{resolved_email} via {email_source} ({env_file_path})"
+    return f"{resolved_email} via {email_source}"
+
 def _build_default_log_details(payload: dict[str, Any]) -> str:
     counts = payload.get("counts", {})
     returned_items = payload.get("returned_items", [])
+    child_items_summary = payload.get("child_items_summary", {})
     project_progress = payload.get("project_progress", {})
     sprint_context = payload.get("sprint_context", {})
     lines = [
@@ -325,16 +369,44 @@ def _build_default_log_details(payload: dict[str, Any]) -> str:
         f"Sprint atual: {sprint_context.get('name') or 'desconhecido'}.",
         f"Goal do sprint: {sprint_context.get('goal') or 'nao exposto pela API atual'}.",
         f"Itens atribuídos: {counts.get('assigned_items', 0)}.",
+        f"Breakdown por tipo dos itens atribuídos: {_format_type_breakdown(counts.get('assigned_items_by_type', {}))}.",
+        f"Tasks do usuario em todos os status: {counts.get('tasks_all_statuses', 0)}, com breakdown {_format_type_breakdown(counts.get('tasks_by_state', {}))}.",
         f"Itens bloqueados: {counts.get('blocked_items', 0)}.",
+        f"Historias bloqueadas no sprint: {project_progress.get('blocked_stories', 0)}, somando {project_progress.get('blocked_story_points', 0)} story points bloqueados.",
+        f"Children ligados aos itens atribuídos: {child_items_summary.get('total_children', 0)}, com {child_items_summary.get('open_children', 0)} abertos e {child_items_summary.get('blocked_children', 0)} bloqueados.",
         f"Itens devolvidos detectados: {len(returned_items)}.",
         f"Historias totais do sprint: {project_progress.get('total_stories', counts.get('sprint_stories', 0))}.",
         f"Story points restantes do projeto: {payload.get('remaining_story_points', 0)}.",
         f"Progresso do projeto: {project_progress.get('progress_percent_by_story_count', 0)}% por historias e {project_progress.get('progress_percent_by_story_points', 0)}% por story points.",
         f"PRs abertas: {counts.get('open_prs', 0)}.",
     ]
+    lines.append(f"Identidade resolvida: {_format_identity_context(payload)}.")
+    child_parent_highlight = _format_child_parent_highlight(child_items_summary)
+    if child_parent_highlight:
+        lines.append(child_parent_highlight)
     if project_progress.get("progress_warning"):
         lines.append(project_progress["progress_warning"])
     return "\n".join(lines)
+
+
+def _format_child_parent_highlight(child_items_summary: dict[str, Any]) -> str:
+    parents = child_items_summary.get("children_by_parent", [])
+    if not isinstance(parents, list) or not parents:
+        return ""
+
+    top_parent = parents[0]
+    if top_parent.get("blocked_child_count", 0) > 0:
+        return (
+            f"Maior foco em children: KL-{top_parent.get('parent_id')} tem "
+            f"{top_parent.get('blocked_child_count', 0)} children bloqueados e "
+            f"{top_parent.get('open_child_count', 0)} abertos."
+        )
+    if top_parent.get("open_child_count", 0) > 0:
+        return (
+            f"Maior carga em children: KL-{top_parent.get('parent_id')} tem "
+            f"{top_parent.get('open_child_count', 0)} children abertos."
+        )
+    return ""
 
 
 @audit("kwikledgers.local_tracking")

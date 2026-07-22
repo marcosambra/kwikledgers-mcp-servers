@@ -16,6 +16,7 @@ Current components:
 - `local_tracking/`: AI tracking files, sprint snapshots, metrics, and logs
 - `windows_calendar/`: notifications and calendar integration
 - `utils/`: shared logger and environment discovery helpers
+- `tests/`: focused MCP regression coverage
 - `.venv/`: local development virtualenv, ignored
 
 ## Why Keep This As One Repo
@@ -47,9 +48,38 @@ Each server launcher:
 
 - locates the nearest `.env` in a parent folder
 - uses the shared local virtualenv under `.venv/`
-- installs its own requirements before startup
+- validates that the shared runtime was prepared by `agent/setup.sh` or `agent/setup.ps1`
+- checks a per-server requirements stamp before startup instead of installing dependencies on demand
 
 This supports a future where the server folders are split into submodules while still reading configuration from the parent `agent/` repo.
+
+## Server Responsibilities
+
+- `azure_devops/`: daily summary, work-item reads, PR context, and controlled Azure write actions
+- `local_tracking/`: `Task_Control`, `Daily_Action_Logs`, `Metrics`, and tracking snapshot reads under `AI_Tracking/`
+- `windows_calendar/`: toast notifications, Outlook event creation, calendar reads, and reminder scheduling from Windows or WSL
+
+The local tracking server is designed so the agent can refresh only the sprint
+snapshot when needed or persist the full daily operational bundle in one call.
+
+## Windows Bridge Notes
+
+The Windows MCP uses an encoded PowerShell bridge so WSL calls do not depend on
+fragile shell quoting. Current behavior:
+
+- notifications are sent through `powershell.exe` when the agent runs inside WSL
+- Outlook access retries transient COM rejections before failing
+- notification and Outlook operations use separate timeout knobs from `agent/.env`
+
+Relevant environment variables:
+
+- `KWIKLEDGERS_WINDOWS_NOTIFICATION_TIMEOUT_SECONDS`
+- `KWIKLEDGERS_WINDOWS_OUTLOOK_TIMEOUT_SECONDS`
+
+## Validation
+
+Focused regression tests live under `tests/`, including coverage for the
+Windows calendar bridge and PowerShell invocation behavior.
 
 ## Recommended License Structure
 
@@ -72,6 +102,8 @@ Suggested license label:
 - `poetry.lock`
 - `azure_devops/server.py`
 - `local_tracking/server.py`
+- `tests/test_windows_calendar.py`
 - `windows_calendar/server.py`
+- `windows_calendar/run.sh`
 - `utils/env.py`
 - `utils/logger.py`

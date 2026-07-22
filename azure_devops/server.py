@@ -24,14 +24,14 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 from azure.devops.connection import Connection
-from azure.devops.v7_0.git.models import GitPullRequestSearchCriteria
+from azure.devops.v7_0.git.models import GitPullRequest, GitPullRequestSearchCriteria
 from azure.devops.v7_0.work_item_tracking.models import TeamContext, Wiql
 from msrest.authentication import BasicAuthentication
 from utils.env import load_env_file
 from utils.logger import audit
 
 
-load_env_file(Path(__file__))
+LOADED_ENV_FILE = load_env_file(Path(__file__))
 
 
 # --- Conexao com Azure DevOps ---
@@ -49,6 +49,56 @@ def get_project():
 
 
 EMPTY_INPUT_SCHEMA = {"type": "object", "properties": {}}
+DEFAULT_PULL_REQUEST_TARGET_BRANCH = "stage-pre-prod"
+STORY_BRANCH_ASSOCIATION_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "story_id": {"type": "integer"},
+        "repository_name": {"type": "string"},
+        "source_branch": {"type": "string"},
+        "related_work_item_ids": {
+            "type": "array",
+            "items": {"type": "integer"},
+        },
+        "include_child_work_items": {"type": "boolean"},
+    },
+    "required": ["story_id", "repository_name", "source_branch"],
+}
+STORY_PULL_REQUEST_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "story_id": {"type": "integer"},
+        "repository_name": {"type": "string"},
+        "source_branch": {"type": "string"},
+        "related_work_item_ids": {
+            "type": "array",
+            "items": {"type": "integer"},
+        },
+        "include_child_work_items": {"type": "boolean"},
+        "title": {"type": "string"},
+        "what_was_changed": {"type": "string"},
+        "affected_processes": {"type": "string"},
+        "expected_impacts": {"type": "string"},
+        "important_points": {"type": "string"},
+        "tests_updated": {"type": "boolean"},
+        "tests_unchanged": {"type": "boolean"},
+        "new_library_name": {"type": "string"},
+        "env_changes": {"type": "string"},
+        "generated_migration_or_seed": {"type": "string"},
+        "new_queue_or_command": {"type": "string"},
+        "mermaid_diagram": {"type": "string"},
+    },
+    "required": [
+        "story_id",
+        "repository_name",
+        "source_branch",
+        "what_was_changed",
+        "affected_processes",
+        "expected_impacts",
+        "important_points",
+        "mermaid_diagram",
+    ],
+}
 COMPLETED_STATES = {"done", "closed", "resolved"}
 WORK_ITEM_TYPE_ALIASES = {
     "task": ("Task",),
@@ -88,6 +138,7 @@ SIMILARITY_STOPWORDS = {
     "service", "story", "task", "tasks", "tecnica", "tecnico", "technical", "tecnicas", "tecnicos",
     "the", "to", "um", "uma", "update", "work", "item",
 }
+ACTIVE_DAILY_SUMMARY_EXCLUDED_STATES = ("Closed", "Removed", "Done", "Resolved")
 
 
 def get_team_context() -> TeamContext:
@@ -120,10 +171,10 @@ server = Server("kwikledgers-azure-devops")
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
-       Tool(name="get_active_user", description="Retorna o email do usuario ativo via git config", inputSchema=EMPTY_INPUT_SCHEMA),
-       Tool(name="get_my_work_items", description="Lista historias, tasks e bugs atribuidos ao usuario ativo no sprint atual", inputSchema=EMPTY_INPUT_SCHEMA),
+         Tool(name="get_active_user", description="Retorna o usuario ativo com nome amigavel e email a partir da configuracao local", inputSchema=EMPTY_INPUT_SCHEMA),
+    Tool(name="get_my_work_items", description="Lista todos os work items ativos atribuidos ao usuario ativo no sprint atual, incluindo user stories, bugs, tasks, technical debts, spikes e outros tipos do processo", inputSchema=EMPTY_INPUT_SCHEMA),
        Tool(name="get_my_blocked_items", description="Lista itens bloqueados atribuidos ao usuario ativo no sprint atual", inputSchema=EMPTY_INPUT_SCHEMA),
-      Tool(name="get_my_daily_summary", description="Retorna um resumo JSON do sprint atual com itens do usuario ativo, progresso do projeto inteiro, historias do sprint, bloqueios, PRs e story points restantes", inputSchema=EMPTY_INPUT_SCHEMA),
+    Tool(name="get_my_daily_summary", description="Retorna um resumo JSON do sprint atual com todos os work items ativos do usuario, breakdown por tipo, progresso do projeto inteiro, historias do sprint, bloqueios, PRs e story points restantes", inputSchema=EMPTY_INPUT_SCHEMA),
         Tool(name="get_user_stories", description="Lista historias do Azure DevOps atribuidas ao email informado",
              inputSchema={"type": "object", "properties": {"email": {"type": "string"}}, "required": ["email"]}),
       Tool(name="get_sprint_stories", description="Retorna JSON estruturado com todas as historias do sprint atual e o progresso agregado do projeto em modo leve", inputSchema=EMPTY_INPUT_SCHEMA),
@@ -132,6 +183,14 @@ async def list_tools() -> list[Tool]:
              inputSchema={"type": "object", "properties": {"story_id": {"type": "integer"}}, "required": ["story_id"]}),
         Tool(name="get_open_prs", description="Lista PRs abertas atribuidas ao usuario",
              inputSchema={"type": "object", "properties": {"email": {"type": "string"}}, "required": ["email"]}),
+           Tool(name="preview_story_branch_association", description="Retorna um preview formal JSON da associacao da branch da historia ao work item pai e as children relacionadas no Azure DevOps",
+               inputSchema=STORY_BRANCH_ASSOCIATION_INPUT_SCHEMA),
+           Tool(name="associate_story_branch", description="Associa a branch da historia ao work item pai e as children relacionadas no Azure DevOps",
+               inputSchema=STORY_BRANCH_ASSOCIATION_INPUT_SCHEMA),
+           Tool(name="preview_story_pull_request", description="Retorna um preview formal JSON da PR Draft da historia para stage-pre-prod, usando o template do repositorio e Mermaid ao final",
+               inputSchema=STORY_PULL_REQUEST_INPUT_SCHEMA),
+           Tool(name="create_story_pull_request", description="Abre uma PR Draft da historia para stage-pre-prod, garante associacao da branch e dos work items e retorna o link direto da PR",
+               inputSchema=STORY_PULL_REQUEST_INPUT_SCHEMA),
         Tool(name="create_work_item", description="Cria um work item no Azure DevOps, opcionalmente ja direcionado para uma iteration especifica ou para a proxima sprint configurada",
              inputSchema={
                  "type": "object",
@@ -268,6 +327,62 @@ async def _dispatch(name: str, arguments: dict) -> str:
         return _get_story_details(arguments["story_id"])
     if name == "get_open_prs":
         return _get_open_prs(arguments["email"])
+    if name == "preview_story_branch_association":
+        return _preview_story_branch_association(
+            story_id=arguments["story_id"],
+            repository_name=arguments["repository_name"],
+            source_branch=arguments["source_branch"],
+            related_work_item_ids=arguments.get("related_work_item_ids"),
+            include_child_work_items=bool(arguments.get("include_child_work_items", True)),
+        )
+    if name == "associate_story_branch":
+        return _associate_story_branch(
+            story_id=arguments["story_id"],
+            repository_name=arguments["repository_name"],
+            source_branch=arguments["source_branch"],
+            related_work_item_ids=arguments.get("related_work_item_ids"),
+            include_child_work_items=bool(arguments.get("include_child_work_items", True)),
+        )
+    if name == "preview_story_pull_request":
+        return _preview_story_pull_request(
+            story_id=arguments["story_id"],
+            repository_name=arguments["repository_name"],
+            source_branch=arguments["source_branch"],
+            related_work_item_ids=arguments.get("related_work_item_ids"),
+            include_child_work_items=bool(arguments.get("include_child_work_items", True)),
+            title=arguments.get("title"),
+            what_was_changed=arguments["what_was_changed"],
+            affected_processes=arguments["affected_processes"],
+            expected_impacts=arguments["expected_impacts"],
+            important_points=arguments["important_points"],
+            tests_updated=bool(arguments.get("tests_updated", False)),
+            tests_unchanged=bool(arguments.get("tests_unchanged", False)),
+            new_library_name=arguments.get("new_library_name"),
+            env_changes=arguments.get("env_changes"),
+            generated_migration_or_seed=arguments.get("generated_migration_or_seed"),
+            new_queue_or_command=arguments.get("new_queue_or_command"),
+            mermaid_diagram=arguments["mermaid_diagram"],
+        )
+    if name == "create_story_pull_request":
+        return _create_story_pull_request(
+            story_id=arguments["story_id"],
+            repository_name=arguments["repository_name"],
+            source_branch=arguments["source_branch"],
+            related_work_item_ids=arguments.get("related_work_item_ids"),
+            include_child_work_items=bool(arguments.get("include_child_work_items", True)),
+            title=arguments.get("title"),
+            what_was_changed=arguments["what_was_changed"],
+            affected_processes=arguments["affected_processes"],
+            expected_impacts=arguments["expected_impacts"],
+            important_points=arguments["important_points"],
+            tests_updated=bool(arguments.get("tests_updated", False)),
+            tests_unchanged=bool(arguments.get("tests_unchanged", False)),
+            new_library_name=arguments.get("new_library_name"),
+            env_changes=arguments.get("env_changes"),
+            generated_migration_or_seed=arguments.get("generated_migration_or_seed"),
+            new_queue_or_command=arguments.get("new_queue_or_command"),
+            mermaid_diagram=arguments["mermaid_diagram"],
+        )
     if name == "create_work_item":
         return _create_work_item(
             work_item_type=arguments["work_item_type"],
@@ -351,6 +466,52 @@ def _resolve_active_user_email() -> Optional[str]:
             return email
 
     return None
+
+
+def _resolve_active_user_identity() -> tuple[Optional[str], Optional[str], Optional[str]]:
+    configured_email = os.environ.get("AZURE_USER_EMAIL", "").strip()
+    if configured_email:
+        env_file = str(LOADED_ENV_FILE) if LOADED_ENV_FILE else None
+        return configured_email, "AZURE_USER_EMAIL", env_file
+
+    for command in ((["git", "config", "user.email"], "git config user.email"), (["git", "config", "--global", "user.email"], "git config --global user.email")):
+        try:
+            result = subprocess.run(command[0], capture_output=True, text=True, timeout=5)
+        except Exception:
+            continue
+
+        email = result.stdout.strip()
+        if email:
+            return email, command[1], None
+
+    return None, None, None
+
+
+def _resolve_active_user_name(email: Optional[str]) -> Optional[str]:
+    configured_name = os.environ.get("AZURE_USER_NAME", "").strip()
+    if configured_name:
+        return configured_name
+
+    for command in ("git config user.name", "git config --global user.name"):
+        try:
+            result = subprocess.run(command.split(), capture_output=True, text=True, timeout=5)
+        except Exception:
+            continue
+
+        name = result.stdout.strip()
+        if name:
+            return name
+
+    local_part = str(email or "").split("@", 1)[0].strip()
+    if not local_part:
+        return None
+
+    normalized = re.sub(r"[._-]+", " ", local_part)
+    cleaned = " ".join(chunk for chunk in normalized.split() if chunk)
+    if not cleaned:
+        return None
+
+    return cleaned.title()
 
 
 def _format_json(payload: dict[str, Any]) -> str:
@@ -559,6 +720,69 @@ def _build_browser_work_item_url(work_item_id: int | None) -> str | None:
     return f"{org_url}/{project}/_workitems/edit/{work_item_id}"
 
 
+def _build_pull_request_browser_url(repository_name: str | None, pull_request_id: int | None) -> str | None:
+    if pull_request_id is None:
+        return None
+
+    normalized_repository_name = str(repository_name or "").strip()
+    if not normalized_repository_name:
+        return None
+
+    org_url = os.environ["AZURE_ORG_URL"].rstrip("/")
+    project = quote(get_project(), safe="")
+    repository = quote(normalized_repository_name, safe="")
+    return f"{org_url}/{project}/_git/{repository}/pullrequest/{pull_request_id}"
+
+
+def _build_branch_browser_url(repository_name: str | None, branch_name: str | None) -> str | None:
+    normalized_repository_name = str(repository_name or "").strip()
+    normalized_branch_name = str(branch_name or "").strip().strip("/")
+    if not normalized_repository_name or not normalized_branch_name:
+        return None
+
+    org_url = os.environ["AZURE_ORG_URL"].rstrip("/")
+    project = quote(get_project(), safe="")
+    repository = quote(normalized_repository_name, safe="")
+    encoded_version = quote(f"GB{normalized_branch_name}", safe="").replace("%2F", "%2f")
+    return f"{org_url}/{project}/_git/{repository}?version={encoded_version}"
+
+
+def _normalize_source_branch(source_branch: str | None) -> tuple[str, str]:
+    normalized_source_branch = str(source_branch or "").strip()
+    if not normalized_source_branch:
+        raise ValueError("source_branch e obrigatoria para o fluxo de branch/PR da historia.")
+
+    plain_branch_name = normalized_source_branch
+    if plain_branch_name.startswith("refs/heads/"):
+        plain_branch_name = plain_branch_name[len("refs/heads/"):]
+    elif plain_branch_name.startswith("heads/"):
+        plain_branch_name = plain_branch_name[len("heads/"):]
+
+    plain_branch_name = plain_branch_name.strip().strip("/")
+    if not plain_branch_name:
+        raise ValueError("source_branch e obrigatoria para o fluxo de branch/PR da historia.")
+
+    return plain_branch_name, f"refs/heads/{plain_branch_name}"
+
+
+def _resolve_repository_project_id(repository: Any) -> str:
+    project_reference = getattr(repository, "project", None)
+    project_id = getattr(project_reference, "id", None)
+    if project_id:
+        return str(project_id)
+
+    raise ValueError("Nao foi possivel resolver o project id do repositorio no Azure DevOps.")
+
+
+def _build_branch_artifact_uri(project_id: str, repository_id: str, branch_name: str) -> str:
+    encoded_branch = quote(f"GB{branch_name}", safe="").replace("%2F", "%2f")
+    return f"vstfs:///Git/Ref/{project_id}%2f{repository_id}%2f{encoded_branch}"
+
+
+def _build_pull_request_artifact_uri(project_id: str, repository_id: str, pull_request_id: int) -> str:
+    return f"vstfs:///Git/PullRequestId/{project_id}%2f{repository_id}%2f{pull_request_id}"
+
+
 def _normalize_repository_key(repository_name: str | None) -> str:
     normalized_name = _normalize_lookup_key(repository_name)
     return normalized_name.replace(" ", "_")
@@ -576,6 +800,571 @@ def _build_repository_aliases(repository_name: str | None) -> set[str]:
         normalized_repository_name.replace(" ", "-"),
     }
     return {alias for alias in aliases if alias}
+
+
+def _resolve_git_repository(git: Any, repository_name: str) -> Any:
+    normalized_repository_name = str(repository_name or "").strip()
+    if not normalized_repository_name:
+        raise ValueError("repository_name e obrigatorio para o fluxo de branch/PR da historia.")
+
+    requested_aliases = _build_repository_aliases(normalized_repository_name)
+    requested_aliases.add(_normalize_lookup_key(normalized_repository_name))
+
+    repositories = git.get_repositories(project=get_project())
+    for repository in repositories or []:
+        candidate_name = str(getattr(repository, "name", "")).strip()
+        candidate_aliases = _build_repository_aliases(candidate_name)
+        candidate_aliases.add(_normalize_lookup_key(candidate_name))
+        if requested_aliases.intersection(candidate_aliases):
+            return repository
+
+    available_repositories = sorted(
+        str(getattr(repository, "name", "")).strip()
+        for repository in repositories or []
+        if str(getattr(repository, "name", "")).strip()
+    )
+    raise ValueError(
+        "Repositorio nao encontrado no Azure DevOps para o fluxo de branch/PR da historia. "
+        f"Recebido: {normalized_repository_name}. Disponiveis: {', '.join(available_repositories)}"
+    )
+
+
+def _resolve_local_repository_path(repository_name: str | None) -> Path | None:
+    projects_dir = WORKSPACE_ROOT / "projects"
+    if not projects_dir.exists():
+        return None
+
+    requested_aliases = _build_repository_aliases(repository_name)
+    requested_aliases.add(_normalize_lookup_key(repository_name))
+
+    for candidate in projects_dir.iterdir():
+        if not candidate.is_dir() or candidate.name == "documentacao":
+            continue
+
+        candidate_aliases = _build_repository_aliases(candidate.name)
+        candidate_aliases.add(_normalize_lookup_key(candidate.name))
+        if requested_aliases.intersection(candidate_aliases):
+            return candidate
+
+    return None
+
+
+def _load_pull_request_template_context(repository_name: str) -> dict[str, Any]:
+    repository_path = _resolve_local_repository_path(repository_name)
+    if repository_path is None:
+        return {
+            "found": False,
+            "path": None,
+            "source": "default",
+        }
+
+    template_path = repository_path / "pull_request_template.md"
+    if not template_path.exists():
+        return {
+            "found": False,
+            "path": None,
+            "source": "default",
+        }
+
+    return {
+        "found": True,
+        "path": str(template_path),
+        "source": "repository",
+    }
+
+
+def _normalize_markdown_block(value: str | None, fallback: str = "Nao informado.") -> str:
+    normalized_value = str(value or "").strip()
+    return normalized_value or fallback
+
+
+def _normalize_mermaid_block(value: str | None) -> str:
+    normalized_value = str(value or "").strip()
+    if not normalized_value:
+        raise ValueError("mermaid_diagram e obrigatorio para o preview e a criacao da PR da historia.")
+
+    if normalized_value.startswith("```"):
+        if normalized_value.lower().startswith("```mermaid"):
+            return normalized_value
+        raise ValueError("mermaid_diagram deve ser conteudo Mermaid ou um bloco ```mermaid```.")
+
+    return f"```mermaid\n{normalized_value}\n```"
+
+
+def _build_checklist_entry(label: str, checked: bool, detail: str | None = None) -> str:
+    entry = f"- [{'x' if checked else ' '}] {label}"
+    normalized_detail = str(detail or "").strip()
+    if normalized_detail:
+        entry = f"{entry} {normalized_detail}"
+    return entry
+
+
+def _build_pull_request_body_markdown(
+    what_was_changed: str,
+    affected_processes: str,
+    expected_impacts: str,
+    important_points: str,
+    mermaid_diagram: str,
+    tests_updated: bool = False,
+    tests_unchanged: bool = False,
+    new_library_name: str | None = None,
+    env_changes: str | None = None,
+    generated_migration_or_seed: str | None = None,
+    new_queue_or_command: str | None = None,
+) -> str:
+    normalized_mermaid = _normalize_mermaid_block(mermaid_diagram)
+    lines = [
+        "# O que foi modificado",
+        _normalize_markdown_block(what_was_changed),
+        "",
+        "# Quais processos essa implementacao afeta",
+        _normalize_markdown_block(affected_processes),
+        "",
+        "# Quais impactos esperados",
+        _normalize_markdown_block(expected_impacts),
+        "",
+        "# Pontos importantes",
+        _normalize_markdown_block(important_points),
+        "",
+        "# Checklist",
+        "",
+        "- Testes",
+        f"  {_build_checklist_entry('Voce adicionou ou ajustou testes unitarios', tests_updated)}",
+        f"  {_build_checklist_entry('Essa PR nao altera testes', tests_unchanged)}",
+        "- Modificacoes",
+        f"  {_build_checklist_entry('Voce adicionou alguma biblioteca nova? se sim qual:', bool(str(new_library_name or '').strip()), new_library_name)}",
+        f"  {_build_checklist_entry('Voce alterou o .env? se sim qual:', bool(str(env_changes or '').strip()), env_changes)}",
+        f"  {_build_checklist_entry('Voce gerou alguma nova migration/seed?', bool(str(generated_migration_or_seed or '').strip()), generated_migration_or_seed)}",
+        f"  {_build_checklist_entry('Voce adicionou alguma nova fila/comando? se sim qual:', bool(str(new_queue_or_command or '').strip()), new_queue_or_command)}",
+        "",
+        "# Diagrama Mermaid",
+        normalized_mermaid,
+    ]
+    return "\n".join(lines).strip()
+
+
+def _extract_relation_name(relation: Any) -> str | None:
+    attributes = getattr(relation, "attributes", None) or {}
+    if isinstance(attributes, dict):
+        relation_name = attributes.get("name")
+    else:
+        relation_name = getattr(attributes, "name", None)
+
+    normalized_relation_name = str(relation_name or "").strip()
+    return normalized_relation_name or None
+
+
+def _extract_artifact_links(relations: list[Any] | None, allowed_names: set[str] | None = None) -> list[dict[str, Any]]:
+    normalized_allowed_names = {name.lower() for name in (allowed_names or set())}
+    artifact_links: list[dict[str, Any]] = []
+
+    for relation in relations or []:
+        if getattr(relation, "rel", "") != "ArtifactLink":
+            continue
+
+        relation_name = _extract_relation_name(relation)
+        if normalized_allowed_names and str(relation_name or "").lower() not in normalized_allowed_names:
+            continue
+
+        artifact_links.append(
+            {
+                "name": relation_name,
+                "url": getattr(relation, "url", None),
+            }
+        )
+
+    return artifact_links
+
+
+def _has_artifact_link(artifact_links: list[dict[str, Any]] | None, artifact_url: str) -> bool:
+    normalized_artifact_url = str(artifact_url or "").strip().lower()
+    if not normalized_artifact_url:
+        return False
+
+    return any(
+        str(link.get("url") or "").strip().lower() == normalized_artifact_url
+        for link in (artifact_links or [])
+    )
+
+
+def _build_artifact_link_patch(artifact_url: str, artifact_name: str) -> dict[str, Any]:
+    return {
+        "op": "add",
+        "path": "/relations/-",
+        "value": {
+            "rel": "ArtifactLink",
+            "url": artifact_url,
+            "attributes": {
+                "name": artifact_name,
+            },
+        },
+    }
+
+
+def _get_story_pr_work_item_fields() -> list[str]:
+    return [
+        "System.Id",
+        "System.Title",
+        "System.State",
+        "System.WorkItemType",
+        "System.IterationPath",
+    ]
+
+
+def _get_work_item_snapshot(wit: Any, work_item_id: int) -> dict[str, Any]:
+    item = wit.get_work_item(id=work_item_id, expand="Relations")
+    fields = getattr(item, "fields", {}) or {}
+    resolved_work_item_id = int(fields.get("System.Id") or work_item_id)
+    return {
+        "id": resolved_work_item_id,
+        "title": fields.get("System.Title"),
+        "state": fields.get("System.State"),
+        "work_item_type": fields.get("System.WorkItemType"),
+        "iteration_path": fields.get("System.IterationPath"),
+        "url": getattr(item, "url", None),
+        "browser_url": _build_browser_work_item_url(resolved_work_item_id),
+        "relations": getattr(item, "relations", None) or [],
+    }
+
+
+def _normalize_related_work_item_ids(related_work_item_ids: list[int] | None) -> list[int]:
+    normalized_ids: list[int] = []
+    seen_ids: set[int] = set()
+    for raw_work_item_id in related_work_item_ids or []:
+        normalized_work_item_id = int(raw_work_item_id)
+        if normalized_work_item_id in seen_ids:
+            continue
+        seen_ids.add(normalized_work_item_id)
+        normalized_ids.append(normalized_work_item_id)
+    return normalized_ids
+
+
+def _resolve_story_related_work_items(
+    wit: Any,
+    story_id: int,
+    related_work_item_ids: list[int] | None = None,
+    include_child_work_items: bool = True,
+) -> dict[str, Any]:
+    normalized_story_id = int(story_id)
+    parent_snapshot = _get_work_item_snapshot(wit, normalized_story_id)
+
+    child_work_item_ids: list[int] = []
+    if include_child_work_items:
+        for relation in parent_snapshot["relations"]:
+            if getattr(relation, "rel", "") != "System.LinkTypes.Hierarchy-Forward":
+                continue
+
+            child_work_item_id_raw = str(getattr(relation, "url", "")).rstrip("/").split("/")[-1]
+            if not child_work_item_id_raw.isdigit():
+                continue
+
+            child_work_item_id = int(child_work_item_id_raw)
+            if child_work_item_id not in child_work_item_ids:
+                child_work_item_ids.append(child_work_item_id)
+
+    extra_related_work_item_ids: list[int] = []
+    ordered_work_item_ids = [normalized_story_id]
+    seen_work_item_ids = {normalized_story_id}
+
+    for child_work_item_id in child_work_item_ids:
+        if child_work_item_id in seen_work_item_ids:
+            continue
+        seen_work_item_ids.add(child_work_item_id)
+        ordered_work_item_ids.append(child_work_item_id)
+
+    for related_work_item_id in _normalize_related_work_item_ids(related_work_item_ids):
+        if related_work_item_id in seen_work_item_ids:
+            continue
+        seen_work_item_ids.add(related_work_item_id)
+        ordered_work_item_ids.append(related_work_item_id)
+        extra_related_work_item_ids.append(related_work_item_id)
+
+    snapshots_by_id: dict[int, dict[str, Any]] = {normalized_story_id: parent_snapshot}
+    for work_item_id in ordered_work_item_ids[1:]:
+        snapshots_by_id[work_item_id] = _get_work_item_snapshot(wit, work_item_id)
+
+    resolved_work_items: list[dict[str, Any]] = []
+    for work_item_id in ordered_work_item_ids:
+        snapshot = dict(snapshots_by_id[work_item_id])
+        if work_item_id == normalized_story_id:
+            relationship_to_story = "parent"
+        elif work_item_id in child_work_item_ids:
+            relationship_to_story = "child"
+        else:
+            relationship_to_story = "related"
+        snapshot["relationship_to_story"] = relationship_to_story
+        resolved_work_items.append(snapshot)
+
+    return {
+        "parent": dict(parent_snapshot),
+        "child_work_item_ids": child_work_item_ids,
+        "extra_related_work_item_ids": extra_related_work_item_ids,
+        "work_items": resolved_work_items,
+    }
+
+
+def _build_story_branch_association_preview_payload(
+    wit: Any,
+    repository: Any,
+    story_id: int,
+    source_branch: str,
+    related_work_item_ids: list[int] | None = None,
+    include_child_work_items: bool = True,
+) -> dict[str, Any]:
+    repository_name = str(getattr(repository, "name", "")).strip()
+    repository_id = str(getattr(repository, "id", "")).strip()
+    if not repository_id:
+        raise ValueError("Nao foi possivel resolver o repository id do Azure DevOps para o fluxo de branch da historia.")
+
+    project_id = _resolve_repository_project_id(repository)
+    normalized_branch_name, source_ref_name = _normalize_source_branch(source_branch)
+    branch_artifact_uri = _build_branch_artifact_uri(project_id, repository_id, normalized_branch_name)
+    work_item_context = _resolve_story_related_work_items(
+        wit,
+        story_id=story_id,
+        related_work_item_ids=related_work_item_ids,
+        include_child_work_items=include_child_work_items,
+    )
+
+    work_items_preview: list[dict[str, Any]] = []
+    already_linked_count = 0
+    pending_link_count = 0
+
+    for snapshot in work_item_context["work_items"]:
+        existing_artifact_links = _extract_artifact_links(
+            snapshot.get("relations"),
+            allowed_names={"Branch", "Pull Request"},
+        )
+        branch_linked = _has_artifact_link(existing_artifact_links, branch_artifact_uri)
+        if branch_linked:
+            already_linked_count += 1
+        else:
+            pending_link_count += 1
+
+        work_items_preview.append(
+            {
+                "id": snapshot["id"],
+                "title": snapshot.get("title"),
+                "state": snapshot.get("state"),
+                "work_item_type": snapshot.get("work_item_type"),
+                "iteration_path": snapshot.get("iteration_path"),
+                "relationship_to_story": snapshot.get("relationship_to_story"),
+                "browser_url": snapshot.get("browser_url"),
+                "existing_artifact_links": existing_artifact_links,
+                "branch_linked": branch_linked,
+            }
+        )
+
+    parent_snapshot = work_item_context["parent"]
+    return {
+        "operation": "preview_story_branch_association",
+        "story_id": int(story_id),
+        "repository_name": repository_name,
+        "repository_id": repository_id,
+        "project": get_project(),
+        "project_id": project_id,
+        "source_branch": normalized_branch_name,
+        "source_ref_name": source_ref_name,
+        "branch_artifact_uri": branch_artifact_uri,
+        "branch_browser_url": _build_branch_browser_url(repository_name, normalized_branch_name),
+        "parent_work_item": {
+            "id": parent_snapshot["id"],
+            "title": parent_snapshot.get("title"),
+            "state": parent_snapshot.get("state"),
+            "work_item_type": parent_snapshot.get("work_item_type"),
+            "browser_url": parent_snapshot.get("browser_url"),
+        },
+        "related_work_item_ids": [
+            work_item["id"]
+            for work_item in work_items_preview
+            if work_item["relationship_to_story"] != "parent"
+        ],
+        "include_child_work_items": bool(include_child_work_items),
+        "work_items": work_items_preview,
+        "counts": {
+            "total_work_items": len(work_items_preview),
+            "already_linked": already_linked_count,
+            "pending_link": pending_link_count,
+        },
+    }
+
+
+def _associate_artifact_to_work_items(
+    wit: Any,
+    work_items: list[dict[str, Any]],
+    artifact_url: str,
+    artifact_name: str,
+) -> dict[str, Any]:
+    associated_work_item_ids: list[int] = []
+    already_linked_work_item_ids: list[int] = []
+    results: list[dict[str, Any]] = []
+
+    for work_item in work_items:
+        current_snapshot = _get_work_item_snapshot(wit, int(work_item["id"]))
+        current_artifact_links = _extract_artifact_links(
+            current_snapshot.get("relations"),
+            allowed_names={"Branch", "Pull Request"},
+        )
+        work_item["existing_artifact_links"] = current_artifact_links
+        already_linked = _has_artifact_link(current_artifact_links, artifact_url)
+
+        if already_linked:
+            already_linked_work_item_ids.append(int(work_item["id"]))
+            action = "already_linked"
+        else:
+            wit.update_work_item(
+                document=[_build_artifact_link_patch(artifact_url, artifact_name)],
+                id=int(work_item["id"]),
+            )
+            associated_work_item_ids.append(int(work_item["id"]))
+            action = "associated"
+            work_item["existing_artifact_links"] = current_artifact_links + [
+                {
+                    "name": artifact_name,
+                    "url": artifact_url,
+                }
+            ]
+
+        results.append(
+            {
+                "id": int(work_item["id"]),
+                "title": work_item.get("title"),
+                "relationship_to_story": work_item.get("relationship_to_story"),
+                "action": action,
+                "browser_url": work_item.get("browser_url"),
+            }
+        )
+
+    return {
+        "artifact_name": artifact_name,
+        "artifact_url": artifact_url,
+        "associated_work_item_ids": associated_work_item_ids,
+        "already_linked_work_item_ids": already_linked_work_item_ids,
+        "associated_count": len(associated_work_item_ids),
+        "already_linked_count": len(already_linked_work_item_ids),
+        "results": results,
+    }
+
+
+def _find_existing_active_pull_request(
+    git: Any,
+    repository_id: str,
+    source_ref_name: str,
+    target_ref_name: str,
+) -> Any | None:
+    pull_requests = git.get_pull_requests(
+        repository_id=repository_id,
+        search_criteria=get_active_pr_search_criteria(),
+        project=get_project(),
+    )
+    normalized_source_ref_name = str(source_ref_name or "").strip().lower()
+    normalized_target_ref_name = str(target_ref_name or "").strip().lower()
+
+    for pull_request in pull_requests or []:
+        if str(getattr(pull_request, "source_ref_name", "")).strip().lower() != normalized_source_ref_name:
+            continue
+        if str(getattr(pull_request, "target_ref_name", "")).strip().lower() != normalized_target_ref_name:
+            continue
+        return pull_request
+
+    return None
+
+
+def _build_pull_request_summary(pull_request: Any, repository_name: str) -> dict[str, Any]:
+    pull_request_id = getattr(pull_request, "pull_request_id", None)
+    return {
+        "pull_request_id": pull_request_id,
+        "title": getattr(pull_request, "title", None),
+        "source_ref_name": getattr(pull_request, "source_ref_name", None),
+        "target_ref_name": getattr(pull_request, "target_ref_name", None),
+        "is_draft": bool(getattr(pull_request, "is_draft", False)),
+        "artifact_id": getattr(pull_request, "artifact_id", None),
+        "remote_url": getattr(pull_request, "remote_url", None),
+        "web_url": _build_pull_request_browser_url(repository_name, pull_request_id),
+    }
+
+
+def _build_story_pull_request_preview_payload(
+    wit: Any,
+    git: Any,
+    repository: Any,
+    story_id: int,
+    source_branch: str,
+    what_was_changed: str,
+    affected_processes: str,
+    expected_impacts: str,
+    important_points: str,
+    mermaid_diagram: str,
+    related_work_item_ids: list[int] | None = None,
+    include_child_work_items: bool = True,
+    title: str | None = None,
+    tests_updated: bool = False,
+    tests_unchanged: bool = False,
+    new_library_name: str | None = None,
+    env_changes: str | None = None,
+    generated_migration_or_seed: str | None = None,
+    new_queue_or_command: str | None = None,
+) -> dict[str, Any]:
+    branch_preview = _build_story_branch_association_preview_payload(
+        wit,
+        repository=repository,
+        story_id=story_id,
+        source_branch=source_branch,
+        related_work_item_ids=related_work_item_ids,
+        include_child_work_items=include_child_work_items,
+    )
+    template_context = _load_pull_request_template_context(branch_preview["repository_name"])
+    target_ref_name = f"refs/heads/{DEFAULT_PULL_REQUEST_TARGET_BRANCH}"
+    parent_title = str(branch_preview["parent_work_item"].get("title") or f"KL-{story_id}").strip()
+    resolved_title = str(title or "").strip() or f"KL-{story_id}: {parent_title}"
+    body_markdown = _build_pull_request_body_markdown(
+        what_was_changed=what_was_changed,
+        affected_processes=affected_processes,
+        expected_impacts=expected_impacts,
+        important_points=important_points,
+        mermaid_diagram=mermaid_diagram,
+        tests_updated=tests_updated,
+        tests_unchanged=tests_unchanged,
+        new_library_name=new_library_name,
+        env_changes=env_changes,
+        generated_migration_or_seed=generated_migration_or_seed,
+        new_queue_or_command=new_queue_or_command,
+    )
+    existing_active_pull_request = _find_existing_active_pull_request(
+        git,
+        repository_id=branch_preview["repository_id"],
+        source_ref_name=branch_preview["source_ref_name"],
+        target_ref_name=target_ref_name,
+    )
+
+    return {
+        "operation": "preview_story_pull_request",
+        "story_id": int(story_id),
+        "repository_name": branch_preview["repository_name"],
+        "repository_id": branch_preview["repository_id"],
+        "project": branch_preview["project"],
+        "project_id": branch_preview["project_id"],
+        "source_branch": branch_preview["source_branch"],
+        "source_ref_name": branch_preview["source_ref_name"],
+        "target_branch": DEFAULT_PULL_REQUEST_TARGET_BRANCH,
+        "target_ref_name": target_ref_name,
+        "is_draft": True,
+        "title": resolved_title,
+        "body_format": "markdown",
+        "body_markdown": body_markdown,
+        "template": template_context,
+        "branch_association_preview": branch_preview,
+        "existing_active_pull_request": (
+            _build_pull_request_summary(existing_active_pull_request, branch_preview["repository_name"])
+            if existing_active_pull_request is not None
+            else None
+        ),
+        "can_open_pull_request": existing_active_pull_request is None,
+        "recommended_story_status_transition": {
+            "story_id": int(story_id),
+            "status": "Aguardando PR",
+        },
+    }
 
 
 def _get_technical_debt_context_path(repository_name: str) -> Path:
@@ -1546,8 +2335,14 @@ def _serialize_work_item_payload(item: Any, extra_payload: Optional[dict[str, An
 
 def _is_blocked_item(fields: dict[str, Any]) -> bool:
     state = str(fields.get("System.State", "")).strip().lower()
+    board_column = str(fields.get("System.BoardColumn", "")).strip().lower()
     tags = str(fields.get("System.Tags", "")).strip().lower()
-    return state in {"blocked", "impeded"} or "blocked" in tags or "impediment" in tags
+    blocked_tokens = ("blocked", "bloqueado", "impeded", "impediment")
+    return (
+        any(token in state for token in blocked_tokens)
+        or any(token in board_column for token in blocked_tokens)
+        or any(token in tags for token in blocked_tokens)
+    )
 
 
 def _is_completed_state(state: Any) -> bool:
@@ -1581,8 +2376,10 @@ def _query_assigned_items(email: str) -> list[dict[str, Any]]:
         FROM WorkItems
         WHERE [System.AssignedTo] = '{email}'
           AND [System.IterationPath] = @CurrentIteration
-          AND [System.WorkItemType] IN ('User Story', 'Task', 'Bug')
-          AND [System.State] NOT IN ('Closed', 'Removed', 'Done')
+                    AND (
+                                [System.WorkItemType] = 'Task'
+                                OR [System.State] NOT IN {ACTIVE_DAILY_SUMMARY_EXCLUDED_STATES}
+                    )
         ORDER BY [System.ChangedDate] DESC
     """)
 
@@ -1613,6 +2410,140 @@ def _query_assigned_items(email: str) -> list[dict[str, Any]]:
             "is_blocked": _is_blocked_item(fields),
         })
     return serialized_items
+
+
+def _count_items_by_type(items: list[dict[str, Any]]) -> dict[str, int]:
+    type_breakdown: dict[str, int] = {}
+    for item in items:
+        item_type = str(item.get("work_item_type") or "Desconhecido").strip() or "Desconhecido"
+        type_breakdown[item_type] = type_breakdown.get(item_type, 0) + 1
+    return dict(sorted(type_breakdown.items(), key=lambda entry: entry[0].lower()))
+
+
+def _is_story_type(work_item_type: str | None) -> bool:
+    return _normalize_lookup_key(work_item_type) in {"user story", "story"}
+
+
+def _is_task_type(work_item_type: str | None) -> bool:
+    return _normalize_lookup_key(work_item_type) == "task"
+
+
+def _count_items_by_state(items: list[dict[str, Any]]) -> dict[str, int]:
+    state_breakdown: dict[str, int] = {}
+    for item in items:
+        state = str(item.get("state") or "Desconhecido").strip() or "Desconhecido"
+        state_breakdown[state] = state_breakdown.get(state, 0) + 1
+    return dict(sorted(state_breakdown.items(), key=lambda entry: entry[0].lower()))
+
+
+def _query_child_items_summary(parent_items: list[dict[str, Any]]) -> dict[str, Any]:
+    if not parent_items:
+        return {
+            "total_children": 0,
+            "open_children": 0,
+            "blocked_children": 0,
+            "completed_children": 0,
+            "children_by_type": {},
+            "parents_with_children": 0,
+            "children_by_parent": [],
+        }
+
+    connection = get_client()
+    wit = connection.clients.get_work_item_tracking_client()
+
+    parent_lookup = {
+        int(item.get("id")): item
+        for item in parent_items
+        if item.get("id") is not None
+    }
+    child_ids_by_parent: dict[int, list[int]] = {}
+    unique_child_ids: list[int] = []
+    seen_child_ids: set[int] = set()
+
+    for parent_id in parent_lookup:
+        parent_work_item = wit.get_work_item(id=parent_id, expand="Relations")
+        relations = getattr(parent_work_item, "relations", None) or []
+        child_ids: list[int] = []
+        for relation in relations:
+            if getattr(relation, "rel", "") != "System.LinkTypes.Hierarchy-Forward":
+                continue
+
+            child_id_raw = str(getattr(relation, "url", "")).rstrip("/").split("/")[-1]
+            if not child_id_raw.isdigit():
+                continue
+
+            child_id = int(child_id_raw)
+            child_ids.append(child_id)
+            if child_id not in seen_child_ids:
+                seen_child_ids.add(child_id)
+                unique_child_ids.append(child_id)
+
+        if child_ids:
+            child_ids_by_parent[parent_id] = child_ids
+
+    if not unique_child_ids:
+        return {
+            "total_children": 0,
+            "open_children": 0,
+            "blocked_children": 0,
+            "completed_children": 0,
+            "children_by_type": {},
+            "parents_with_children": 0,
+            "children_by_parent": [],
+        }
+
+    child_items = wit.get_work_items(ids=[str(child_id) for child_id in unique_child_ids], fields=[
+        "System.Id", "System.Title", "System.State", "System.WorkItemType",
+        "System.IterationPath", "System.ChangedDate", "System.Tags",
+        "Microsoft.VSTS.Scheduling.StoryPoints", "Microsoft.VSTS.Scheduling.RemainingWork"
+    ])
+
+    serialized_children: dict[int, dict[str, Any]] = {}
+    for item in child_items:
+        fields = item.fields
+        state = fields.get("System.State")
+        child_id = int(fields.get("System.Id"))
+        serialized_children[child_id] = {
+            "id": child_id,
+            "title": fields.get("System.Title"),
+            "state": state,
+            "work_item_type": fields.get("System.WorkItemType"),
+            "iteration_path": fields.get("System.IterationPath"),
+            "changed_at": str(fields.get("System.ChangedDate", "")),
+            "story_points": fields.get("Microsoft.VSTS.Scheduling.StoryPoints") or 0,
+            "remaining_work_hours": fields.get("Microsoft.VSTS.Scheduling.RemainingWork") or 0,
+            "tags": fields.get("System.Tags", ""),
+            "is_blocked": _is_blocked_item(fields),
+            "is_completed": _is_completed_state(state),
+        }
+
+    serialized_child_list = list(serialized_children.values())
+    children_by_parent: list[dict[str, Any]] = []
+    for parent_id, child_ids in child_ids_by_parent.items():
+        child_entries = [serialized_children[child_id] for child_id in child_ids if child_id in serialized_children]
+        if not child_entries:
+            continue
+
+        children_by_parent.append({
+            "parent_id": parent_id,
+            "parent_title": parent_lookup[parent_id].get("title"),
+            "child_count": len(child_entries),
+            "open_child_count": sum(1 for child in child_entries if not child.get("is_completed")),
+            "blocked_child_count": sum(1 for child in child_entries if child.get("is_blocked") and not child.get("is_completed")),
+            "children": child_entries,
+        })
+
+    children_by_parent.sort(key=lambda entry: (-entry["blocked_child_count"], -entry["open_child_count"], entry["parent_id"]))
+
+    return {
+        "total_children": len(serialized_child_list),
+        "open_children": sum(1 for child in serialized_child_list if not child.get("is_completed")),
+        "blocked_children": sum(1 for child in serialized_child_list if child.get("is_blocked") and not child.get("is_completed")),
+        "completed_children": sum(1 for child in serialized_child_list if child.get("is_completed")),
+        "children_by_type": _count_items_by_type(serialized_child_list),
+        "parents_with_children": len(children_by_parent),
+        "children_by_parent": children_by_parent,
+    }
 
 
 def _query_sprint_stories(include_details: bool = False) -> list[dict[str, Any]]:
@@ -1763,10 +2694,16 @@ def _build_project_progress(sprint_stories: list[dict[str, Any]]) -> dict[str, A
 
 
 def _build_daily_summary(email: str) -> dict[str, Any]:
+    resolved_email, email_source, env_file_path = _resolve_active_user_identity()
+    user_name = _resolve_active_user_name(email)
     items = _query_assigned_items(email)
     blocked_items = [item for item in items if item["is_blocked"]]
-    story_items = [item for item in items if item["work_item_type"] == "User Story"]
-    assigned_story_points = sum(float(item["story_points"] or 0) for item in story_items)
+    story_items = [item for item in items if _is_story_type(item.get("work_item_type"))]
+    task_items = [item for item in items if _is_task_type(item.get("work_item_type"))]
+    assigned_item_type_breakdown = _count_items_by_type(items)
+    task_state_breakdown = _count_items_by_state(task_items)
+    child_items_summary = _query_child_items_summary(items)
+    assigned_story_points = sum(float(item["story_points"] or 0) for item in items)
     remaining_work_hours = sum(float(item["remaining_work_hours"] or 0) for item in items)
     sprint_stories = _query_sprint_stories()
     project_progress = _build_project_progress(sprint_stories)
@@ -1800,11 +2737,22 @@ def _build_daily_summary(email: str) -> dict[str, Any]:
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "project": get_project(),
         "user_email": email,
+        "user_name": user_name,
+        "user_identity_context": {
+            "resolved_email": resolved_email,
+            "email_source": email_source,
+            "env_file_path": env_file_path,
+        },
         "counts": {
             "assigned_items": len(items),
             "blocked_items": len(blocked_items),
             "open_prs": len(open_prs),
             "user_stories": len(story_items),
+            "tasks_all_statuses": len(task_items),
+            "tasks_by_state": task_state_breakdown,
+            "assigned_items_by_type": assigned_item_type_breakdown,
+            "children_of_assigned_items": child_items_summary["total_children"],
+            "blocked_children_of_assigned_items": child_items_summary["blocked_children"],
             "sprint_stories": len(sprint_stories),
         },
         "remaining_story_points": project_progress["remaining_story_points"],
@@ -1812,6 +2760,7 @@ def _build_daily_summary(email: str) -> dict[str, Any]:
         "remaining_work_hours": remaining_work_hours,
         "sprint_context": sprint_context,
         "project_progress": project_progress,
+        "child_items_summary": child_items_summary,
         "sprint_stories": sprint_stories,
         "items": items,
         "blocked_items": blocked_items,
@@ -1820,9 +2769,12 @@ def _build_daily_summary(email: str) -> dict[str, Any]:
 
 @audit("kwikledgers.azure_devops")
 def _get_active_user() -> str:
-    """Le o email do git config local ou global."""
+    """Le o usuario ativo da configuracao local e devolve nome amigavel e email."""
     email = _resolve_active_user_email()
     if email:
+        name = _resolve_active_user_name(email)
+        if name:
+            return f"Usuario ativo: {name} <{email}>"
         return f"Usuario ativo: {email}"
     return "Email nao configurado. Configure AZURE_USER_EMAIL no .env ou git config --global user.email seu@email.com"
 
@@ -1933,7 +2885,7 @@ def _get_story_details(story_id: int) -> str:
     connection = get_client()
     wit = connection.clients.get_work_item_tracking_client()
 
-    item = wit.get_work_item(id=story_id, expand="Relations", fields=[
+    item = wit.get_work_item(id=story_id, fields=[
         "System.Id", "System.Title", "System.Description", "System.State",
         "Microsoft.VSTS.Common.AcceptanceCriteria",
         "Microsoft.VSTS.Scheduling.StoryPoints",
@@ -1941,6 +2893,7 @@ def _get_story_details(story_id: int) -> str:
         "System.IterationPath", "System.AssignedTo",
         "System.Tags"
     ])
+    relation_item = wit.get_work_item(id=story_id, expand="Relations")
 
     f = item.fields
     lines = [
@@ -1959,10 +2912,10 @@ def _get_story_details(story_id: int) -> str:
     ]
 
     # Busca tasks filhas
-    if item.relations:
+    if relation_item.relations:
         task_ids = [
             rel.url.split("/")[-1]
-            for rel in item.relations
+            for rel in relation_item.relations
             if rel.rel == "System.LinkTypes.Hierarchy-Forward"
         ]
         if task_ids:
@@ -2008,6 +2961,239 @@ def _get_open_prs(email: str) -> str:
     if not open_prs:
         return "Nenhuma PR aberta encontrada para este usuario."
     return "PRs abertas:\n\n" + "\n\n".join(open_prs)
+
+
+@audit("kwikledgers.azure_devops")
+def _preview_story_branch_association(
+    story_id: int,
+    repository_name: str,
+    source_branch: str,
+    related_work_item_ids: list[int] | None = None,
+    include_child_work_items: bool = True,
+) -> str:
+    connection = get_client()
+    git = connection.clients.get_git_client()
+    wit = connection.clients.get_work_item_tracking_client()
+    repository = _resolve_git_repository(git, repository_name)
+    preview_payload = _build_story_branch_association_preview_payload(
+        wit,
+        repository=repository,
+        story_id=story_id,
+        source_branch=source_branch,
+        related_work_item_ids=related_work_item_ids,
+        include_child_work_items=include_child_work_items,
+    )
+    return _format_json(preview_payload)
+
+
+@audit("kwikledgers.azure_devops")
+def _associate_story_branch(
+    story_id: int,
+    repository_name: str,
+    source_branch: str,
+    related_work_item_ids: list[int] | None = None,
+    include_child_work_items: bool = True,
+) -> str:
+    connection = get_client()
+    git = connection.clients.get_git_client()
+    wit = connection.clients.get_work_item_tracking_client()
+    repository = _resolve_git_repository(git, repository_name)
+    preview_payload = _build_story_branch_association_preview_payload(
+        wit,
+        repository=repository,
+        story_id=story_id,
+        source_branch=source_branch,
+        related_work_item_ids=related_work_item_ids,
+        include_child_work_items=include_child_work_items,
+    )
+    association_result = _associate_artifact_to_work_items(
+        wit,
+        work_items=preview_payload["work_items"],
+        artifact_url=preview_payload["branch_artifact_uri"],
+        artifact_name="Branch",
+    )
+    preview_payload.update(
+        {
+            "executed": True,
+            "association_result": association_result,
+        }
+    )
+    return _format_json(preview_payload)
+
+
+@audit("kwikledgers.azure_devops")
+def _preview_story_pull_request(
+    story_id: int,
+    repository_name: str,
+    source_branch: str,
+    what_was_changed: str,
+    affected_processes: str,
+    expected_impacts: str,
+    important_points: str,
+    mermaid_diagram: str,
+    related_work_item_ids: list[int] | None = None,
+    include_child_work_items: bool = True,
+    title: str | None = None,
+    tests_updated: bool = False,
+    tests_unchanged: bool = False,
+    new_library_name: str | None = None,
+    env_changes: str | None = None,
+    generated_migration_or_seed: str | None = None,
+    new_queue_or_command: str | None = None,
+) -> str:
+    connection = get_client()
+    git = connection.clients.get_git_client()
+    wit = connection.clients.get_work_item_tracking_client()
+    repository = _resolve_git_repository(git, repository_name)
+    preview_payload = _build_story_pull_request_preview_payload(
+        wit,
+        git=git,
+        repository=repository,
+        story_id=story_id,
+        source_branch=source_branch,
+        related_work_item_ids=related_work_item_ids,
+        include_child_work_items=include_child_work_items,
+        title=title,
+        what_was_changed=what_was_changed,
+        affected_processes=affected_processes,
+        expected_impacts=expected_impacts,
+        important_points=important_points,
+        tests_updated=tests_updated,
+        tests_unchanged=tests_unchanged,
+        new_library_name=new_library_name,
+        env_changes=env_changes,
+        generated_migration_or_seed=generated_migration_or_seed,
+        new_queue_or_command=new_queue_or_command,
+        mermaid_diagram=mermaid_diagram,
+    )
+    return _format_json(preview_payload)
+
+
+@audit("kwikledgers.azure_devops")
+def _create_story_pull_request(
+    story_id: int,
+    repository_name: str,
+    source_branch: str,
+    what_was_changed: str,
+    affected_processes: str,
+    expected_impacts: str,
+    important_points: str,
+    mermaid_diagram: str,
+    related_work_item_ids: list[int] | None = None,
+    include_child_work_items: bool = True,
+    title: str | None = None,
+    tests_updated: bool = False,
+    tests_unchanged: bool = False,
+    new_library_name: str | None = None,
+    env_changes: str | None = None,
+    generated_migration_or_seed: str | None = None,
+    new_queue_or_command: str | None = None,
+) -> str:
+    connection = get_client()
+    git = connection.clients.get_git_client()
+    wit = connection.clients.get_work_item_tracking_client()
+    repository = _resolve_git_repository(git, repository_name)
+    preview_payload = _build_story_pull_request_preview_payload(
+        wit,
+        git=git,
+        repository=repository,
+        story_id=story_id,
+        source_branch=source_branch,
+        related_work_item_ids=related_work_item_ids,
+        include_child_work_items=include_child_work_items,
+        title=title,
+        what_was_changed=what_was_changed,
+        affected_processes=affected_processes,
+        expected_impacts=expected_impacts,
+        important_points=important_points,
+        tests_updated=tests_updated,
+        tests_unchanged=tests_unchanged,
+        new_library_name=new_library_name,
+        env_changes=env_changes,
+        generated_migration_or_seed=generated_migration_or_seed,
+        new_queue_or_command=new_queue_or_command,
+        mermaid_diagram=mermaid_diagram,
+    )
+
+    branch_association_result = _associate_artifact_to_work_items(
+        wit,
+        work_items=preview_payload["branch_association_preview"]["work_items"],
+        artifact_url=preview_payload["branch_association_preview"]["branch_artifact_uri"],
+        artifact_name="Branch",
+    )
+
+    pull_request_summary = preview_payload.get("existing_active_pull_request")
+    created = False
+    if pull_request_summary is None:
+        created_pull_request = git.create_pull_request(
+            GitPullRequest(
+                source_ref_name=preview_payload["source_ref_name"],
+                target_ref_name=preview_payload["target_ref_name"],
+                title=preview_payload["title"],
+                description=preview_payload["body_markdown"],
+                is_draft=True,
+            ),
+            repository_id=preview_payload["repository_id"],
+            project=get_project(),
+            supports_iterations=True,
+        )
+        pull_request_summary = _build_pull_request_summary(
+            created_pull_request,
+            preview_payload["repository_name"],
+        )
+        created = True
+
+    if pull_request_summary is None or pull_request_summary.get("pull_request_id") is None:
+        raise ValueError("Nao foi possivel resolver a PR da historia apos a tentativa de criacao/recuperacao.")
+
+    pull_request_artifact_id = (
+        pull_request_summary.get("artifact_id")
+        or _build_pull_request_artifact_uri(
+            preview_payload["project_id"],
+            preview_payload["repository_id"],
+            int(pull_request_summary["pull_request_id"]),
+        )
+    )
+    pull_request_summary["artifact_id"] = pull_request_artifact_id
+
+    pull_request_association_result = _associate_artifact_to_work_items(
+        wit,
+        work_items=preview_payload["branch_association_preview"]["work_items"],
+        artifact_url=pull_request_artifact_id,
+        artifact_name="Pull Request",
+    )
+
+    try:
+        work_item_refs = git.get_pull_request_work_item_refs(
+            repository_id=preview_payload["repository_id"],
+            pull_request_id=int(pull_request_summary["pull_request_id"]),
+            project=get_project(),
+        )
+        pull_request_summary["work_item_refs"] = [
+            {
+                "id": getattr(work_item_ref, "id", None),
+                "url": getattr(work_item_ref, "url", None),
+            }
+            for work_item_ref in (work_item_refs or [])
+        ]
+    except Exception:
+        pull_request_summary["work_item_refs"] = None
+
+    preview_payload.update(
+        {
+            "executed": True,
+            "created": created,
+            "pull_request": pull_request_summary,
+            "branch_association_result": branch_association_result,
+            "pull_request_association_result": pull_request_association_result,
+            "message": (
+                "PR Draft criada com sucesso e link retornado ao usuario."
+                if created
+                else "Ja existia uma PR ativa para esta branch; o link existente foi retornado e os work items foram garantidos na branch/PR."
+            ),
+        }
+    )
+    return _format_json(preview_payload)
 
 
 @audit("kwikledgers.azure_devops")
