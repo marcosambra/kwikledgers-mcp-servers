@@ -50,6 +50,10 @@ def get_project():
 
 EMPTY_INPUT_SCHEMA = {"type": "object", "properties": {}}
 DEFAULT_PULL_REQUEST_TARGET_BRANCH = "stage-pre-prod"
+ALLOWED_PULL_REQUEST_TARGET_BRANCHES = (
+    DEFAULT_PULL_REQUEST_TARGET_BRANCH,
+    "stage-homolog",
+)
 STORY_BRANCH_ASSOCIATION_INPUT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -75,6 +79,10 @@ STORY_PULL_REQUEST_INPUT_SCHEMA = {
             "items": {"type": "integer"},
         },
         "include_child_work_items": {"type": "boolean"},
+        "target_branch": {
+            "type": "string",
+            "enum": list(ALLOWED_PULL_REQUEST_TARGET_BRANCHES),
+        },
         "title": {"type": "string"},
         "what_was_changed": {"type": "string"},
         "affected_processes": {"type": "string"},
@@ -187,9 +195,9 @@ async def list_tools() -> list[Tool]:
                inputSchema=STORY_BRANCH_ASSOCIATION_INPUT_SCHEMA),
            Tool(name="associate_story_branch", description="Associa a branch da historia ao work item pai e as children relacionadas no Azure DevOps",
                inputSchema=STORY_BRANCH_ASSOCIATION_INPUT_SCHEMA),
-           Tool(name="preview_story_pull_request", description="Retorna um preview formal JSON da PR Draft da historia para stage-pre-prod, usando o template do repositorio e Mermaid ao final",
+           Tool(name="preview_story_pull_request", description="Retorna um preview formal JSON da PR Draft da historia para stage-pre-prod por padrao ou stage-homolog quando informado, usando o template do repositorio e Mermaid ao final",
                inputSchema=STORY_PULL_REQUEST_INPUT_SCHEMA),
-           Tool(name="create_story_pull_request", description="Abre uma PR Draft da historia para stage-pre-prod, garante associacao da branch e dos work items e retorna o link direto da PR",
+           Tool(name="create_story_pull_request", description="Abre uma PR Draft da historia para stage-pre-prod por padrao ou stage-homolog quando informado, garante associacao da branch e dos work items e retorna o link direto da PR",
                inputSchema=STORY_PULL_REQUEST_INPUT_SCHEMA),
         Tool(name="create_work_item", description="Cria um work item no Azure DevOps, opcionalmente ja direcionado para uma iteration especifica ou para a proxima sprint configurada",
              inputSchema={
@@ -350,6 +358,7 @@ async def _dispatch(name: str, arguments: dict) -> str:
             source_branch=arguments["source_branch"],
             related_work_item_ids=arguments.get("related_work_item_ids"),
             include_child_work_items=bool(arguments.get("include_child_work_items", True)),
+            target_branch=arguments.get("target_branch"),
             title=arguments.get("title"),
             what_was_changed=arguments["what_was_changed"],
             affected_processes=arguments["affected_processes"],
@@ -370,6 +379,7 @@ async def _dispatch(name: str, arguments: dict) -> str:
             source_branch=arguments["source_branch"],
             related_work_item_ids=arguments.get("related_work_item_ids"),
             include_child_work_items=bool(arguments.get("include_child_work_items", True)),
+            target_branch=arguments.get("target_branch"),
             title=arguments.get("title"),
             what_was_changed=arguments["what_was_changed"],
             affected_processes=arguments["affected_processes"],
@@ -1297,6 +1307,7 @@ def _build_story_pull_request_preview_payload(
     mermaid_diagram: str,
     related_work_item_ids: list[int] | None = None,
     include_child_work_items: bool = True,
+    target_branch: str | None = None,
     title: str | None = None,
     tests_updated: bool = False,
     tests_unchanged: bool = False,
@@ -1314,7 +1325,8 @@ def _build_story_pull_request_preview_payload(
         include_child_work_items=include_child_work_items,
     )
     template_context = _load_pull_request_template_context(branch_preview["repository_name"])
-    target_ref_name = f"refs/heads/{DEFAULT_PULL_REQUEST_TARGET_BRANCH}"
+    resolved_target_branch = _resolve_pull_request_target_branch(target_branch)
+    target_ref_name = f"refs/heads/{resolved_target_branch}"
     parent_title = str(branch_preview["parent_work_item"].get("title") or f"KL-{story_id}").strip()
     resolved_title = str(title or "").strip() or f"KL-{story_id}: {parent_title}"
     body_markdown = _build_pull_request_body_markdown(
@@ -1346,7 +1358,7 @@ def _build_story_pull_request_preview_payload(
         "project_id": branch_preview["project_id"],
         "source_branch": branch_preview["source_branch"],
         "source_ref_name": branch_preview["source_ref_name"],
-        "target_branch": DEFAULT_PULL_REQUEST_TARGET_BRANCH,
+        "target_branch": resolved_target_branch,
         "target_ref_name": target_ref_name,
         "is_draft": True,
         "title": resolved_title,
@@ -1365,6 +1377,16 @@ def _build_story_pull_request_preview_payload(
             "status": "Aguardando PR",
         },
     }
+
+
+def _resolve_pull_request_target_branch(target_branch: str | None) -> str:
+    resolved_target_branch = str(target_branch or "").strip() or DEFAULT_PULL_REQUEST_TARGET_BRANCH
+    if resolved_target_branch not in ALLOWED_PULL_REQUEST_TARGET_BRANCHES:
+        allowed_targets = ", ".join(ALLOWED_PULL_REQUEST_TARGET_BRANCHES)
+        raise ValueError(
+            f"target_branch invalido: {resolved_target_branch}. Valores aceitos: {allowed_targets}"
+        )
+    return resolved_target_branch
 
 
 def _get_technical_debt_context_path(repository_name: str) -> Path:
@@ -3033,6 +3055,7 @@ def _preview_story_pull_request(
     mermaid_diagram: str,
     related_work_item_ids: list[int] | None = None,
     include_child_work_items: bool = True,
+    target_branch: str | None = None,
     title: str | None = None,
     tests_updated: bool = False,
     tests_unchanged: bool = False,
@@ -3053,6 +3076,7 @@ def _preview_story_pull_request(
         source_branch=source_branch,
         related_work_item_ids=related_work_item_ids,
         include_child_work_items=include_child_work_items,
+        target_branch=target_branch,
         title=title,
         what_was_changed=what_was_changed,
         affected_processes=affected_processes,
@@ -3081,6 +3105,7 @@ def _create_story_pull_request(
     mermaid_diagram: str,
     related_work_item_ids: list[int] | None = None,
     include_child_work_items: bool = True,
+    target_branch: str | None = None,
     title: str | None = None,
     tests_updated: bool = False,
     tests_unchanged: bool = False,
@@ -3101,6 +3126,7 @@ def _create_story_pull_request(
         source_branch=source_branch,
         related_work_item_ids=related_work_item_ids,
         include_child_work_items=include_child_work_items,
+        target_branch=target_branch,
         title=title,
         what_was_changed=what_was_changed,
         affected_processes=affected_processes,

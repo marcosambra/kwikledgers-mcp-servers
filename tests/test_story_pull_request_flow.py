@@ -221,6 +221,42 @@ class StoryPullRequestFlowTests(unittest.TestCase):
         self.assertEqual(payload["branch_association_preview"]["counts"]["pending_link"], 2)
         self.assertIn("```mermaid", payload["body_markdown"])
 
+    def test_preview_story_pull_request_accepts_stage_homolog_target(self):
+        repository = SimpleNamespace(id="repo-1", name="portal_backend", project=SimpleNamespace(id="proj-1"))
+        story = _FakeWorkItem(100, "Ajuste do fluxo de cadastro", "Active", "User Story")
+        wit = _FakeWorkItemTrackingClient({100: story})
+        git = _FakeGitClient(repository)
+
+        with (
+            patch.object(azure_server, "get_client", return_value=_FakeConnection(git, wit)),
+            patch.object(azure_server, "get_project", return_value="Kwik Ledgers"),
+            patch.object(
+                azure_server,
+                "_load_pull_request_template_context",
+                return_value={
+                    "found": True,
+                    "path": "/workspace/projects/portal_backend/pull_request_template.md",
+                    "source": "repository",
+                },
+            ),
+        ):
+            payload = json.loads(
+                azure_server._preview_story_pull_request(
+                    story_id=100,
+                    repository_name="portal_backend",
+                    source_branch="feature/KL-100-ajuste-fluxo",
+                    target_branch="stage-homolog",
+                    what_was_changed="Ajustei o cadastro do usuario.",
+                    affected_processes="- API",
+                    expected_impacts="Fluxo de cadastro estabilizado.",
+                    important_points="Sem alteracao contratual no endpoint.",
+                    mermaid_diagram="graph TD\nA --> B",
+                )
+            )
+
+        self.assertEqual(payload["target_branch"], "stage-homolog")
+        self.assertEqual(payload["target_ref_name"], "refs/heads/stage-homolog")
+
     def test_create_story_pull_request_links_branch_and_pr_for_parent_and_child(self):
         repository = SimpleNamespace(id="repo-1", name="portal_backend", project=SimpleNamespace(id="proj-1"))
         story = _FakeWorkItem(
@@ -282,6 +318,43 @@ class StoryPullRequestFlowTests(unittest.TestCase):
         self.assertTrue(any(link["name"] == "Pull Request" for link in parent_links))
         self.assertTrue(any(link["name"] == "Branch" for link in child_links))
         self.assertTrue(any(link["name"] == "Pull Request" for link in child_links))
+
+    def test_create_story_pull_request_can_open_draft_to_stage_homolog(self):
+        repository = SimpleNamespace(id="repo-1", name="portal_backend", project=SimpleNamespace(id="proj-1"))
+        story = _FakeWorkItem(100, "Ajuste do fluxo de cadastro", "Active", "User Story")
+        wit = _FakeWorkItemTrackingClient({100: story})
+        git = _FakeGitClient(repository)
+
+        with (
+            patch.object(azure_server, "get_client", return_value=_FakeConnection(git, wit)),
+            patch.object(azure_server, "get_project", return_value="Kwik Ledgers"),
+            patch.object(
+                azure_server,
+                "_load_pull_request_template_context",
+                return_value={
+                    "found": True,
+                    "path": "/workspace/projects/portal_backend/pull_request_template.md",
+                    "source": "repository",
+                },
+            ),
+        ):
+            payload = json.loads(
+                azure_server._create_story_pull_request(
+                    story_id=100,
+                    repository_name="portal_backend",
+                    source_branch="feature/KL-100-ajuste-fluxo",
+                    target_branch="stage-homolog",
+                    what_was_changed="Ajustei o cadastro do usuario.",
+                    affected_processes="- API",
+                    expected_impacts="Fluxo de cadastro estabilizado.",
+                    important_points="Sem alteracao contratual no endpoint.",
+                    mermaid_diagram="graph TD\nA --> B",
+                )
+            )
+
+        self.assertTrue(payload["created"])
+        self.assertEqual(payload["target_branch"], "stage-homolog")
+        self.assertEqual(git.created_pull_requests[0]["target_ref_name"], "refs/heads/stage-homolog")
 
 
 if __name__ == "__main__":
