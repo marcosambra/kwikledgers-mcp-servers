@@ -3260,6 +3260,12 @@ def _create_work_item(
 
     connection = get_client()
     wit = connection.clients.get_work_item_tracking_client()
+
+    # sem iteration explicita e sem pedido de proxima sprint: herda a iteration do work item pai
+    if not target_iteration_path and not use_next_sprint and parent_work_item_id:
+        parent_item = wit.get_work_item(id=parent_work_item_id, fields=["System.IterationPath"])
+        target_iteration_path = str(parent_item.fields.get("System.IterationPath") or "").strip()
+
     resolved_work_item_type = _resolve_work_item_type_name(wit, normalized_work_item_type)
     supported_fields = _get_supported_work_item_fields(wit, resolved_work_item_type)
 
